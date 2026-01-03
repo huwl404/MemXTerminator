@@ -1,25 +1,49 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: MemXTerminator
 Version: 1.2.2
 Summary: A software for membrane analysis and subtraction in cryo-EM
-Home-page: https://github.com/ZhenHuangLab/MemXTerminator
+Home-page: https://github.com/MemXTerminator/MemXTerminator
 Author: Zhen Huang
 Author-email: zhen.victor.huang@gmail.com
 License: GPLv3
 Keywords: cryo-EM,membrane protein,membrane subtraction
-Platform: UNKNOWN
 Classifier: Development Status :: 4 - Beta
 Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)
 Classifier: Programming Language :: Python :: 3.9
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 License-File: LICENSE
+Requires-Dist: cryosparc-tools>=4.3.1
+Requires-Dist: deap==1.4.1
+Requires-Dist: matplotlib==3.7.2
+Requires-Dist: mrcfile==1.4.3
+Requires-Dist: multiprocess==0.70.15
+Requires-Dist: numpy>=1.25.2
+Requires-Dist: pandas==2.1.0
+Requires-Dist: PyQt5==5.15.9
+Requires-Dist: scikit-image==0.19.3
+Requires-Dist: scipy==1.11.1
+Requires-Dist: starfile==0.4.12
+Requires-Dist: cupy-cuda12x==12.2.0
+Requires-Dist: setproctitle==1.3.3
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
 
 # MemXTerminator
 
 A software for membrane analysis and subtraction in cryo-EM.
 
-![overview](./wiki/docs/assets/images/0-1.png)
+![overview](https://memxterminator.github.io/wiki/assets/images/0-1.png)
 
 ## Overview
 
@@ -39,11 +63,11 @@ This software utilizes 2D averages and their corresponding alignment information
 
 ## Wiki
 
-This software has a very accessible [wiki](https://zhenhuanglab.github.io/MemXTerminator/) for better tutorial organization.
+This software has a very accessible [wiki](https://memxterminator.github.io/wiki/) for better tutorial organization.
 
 ## Installation
 
-For specific installation methods, please refer to the [wiki installation section](https://zhenhuanglab.github.io/MemXTerminator/tutorials/installation/).
+For specific installation methods, please refer to the [wiki installation section](https://memxterminator.github.io/wiki/tutorials/installation/).
 
 ## Usage
 
@@ -55,7 +79,7 @@ MemXTerminator gui &
 
 ```
 
-For detailed usage tutorials, please refer to the [wiki usage section](https://zhenhuanglab.github.io/MemXTerminator/tutorials/usage/).
+For detailed usage tutorials, please refer to the [wiki usage section](https://memxterminator.github.io/wiki/tutorials/usage/).
 
 ## License
 
@@ -74,5 +98,3 @@ I am still working on improving this software. More exciting features are on the
 ## Contact
 
 If you have any questions, please contact me: [zhen.victor.huang@gmail.com](mailto:zhen.victor.huang@gmail.com)
-
-
