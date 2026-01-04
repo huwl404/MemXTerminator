@@ -4,15 +4,12 @@ from ..GUI.radon_gui import Ui_Form
 from ..GUI.radonfit_membrane_analyzer_gui import Ui_MembraneAnalyzer
 from ..GUI.radonfit_membrane_subtraction_gui import Ui_MembraneSubtraction
 from ..GUI.MicrographMembraneSubtraction_Radonfit import Ui_MicrographMembraneSubtraction_Radonfit
-import numpy as np
-import cupy as cp
-import matplotlib.pyplot as plt
 import os
 import json
 import mrcfile
-from ..radonfit.lib._utils import *
-from ..radonfit.lib.radonanalyser import *
 import subprocess
+
+from ._deps import check_cupy_cuda_available
 
 
 class RadonApp(QtWidgets.QDialog, Ui_Form):
@@ -36,6 +33,33 @@ class RadonApp(QtWidgets.QDialog, Ui_Form):
         self.analyzer = None
         self.params = {}
 
+    def _show_gpu_required(self, details: str) -> None:
+        QMessageBox.critical(
+            self,
+            "GPU feature unavailable",
+            (
+                "This feature requires a CUDA-capable GPU and a working CuPy (`cupy`) installation.\n\n"
+                f"{details}\n\n"
+                "Tip: start the GUI on a GPU node (or ensure CUDA libraries are available) "
+                "and try again."
+            ),
+        )
+
+    def _import_radonfit_gpu(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            self._show_gpu_required(details)
+            return None, None
+
+        try:
+            from ..radonfit.lib._utils import readmrc
+            from ..radonfit.lib.radonanalyser import RadonAnalyzer
+        except Exception as exc:
+            self._show_gpu_required(f"Failed to import Radonfit GPU modules: {type(exc).__name__}: {exc}")
+            return None, None
+
+        return readmrc, RadonAnalyzer
+
     def browse_file(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Open MRC File", "", "MRC Files (*.mrc)")
         if filepath:
@@ -53,13 +77,21 @@ class RadonApp(QtWidgets.QDialog, Ui_Form):
 
     def preview_section(self):
         if self.mrc_file:
+            readmrc, _RadonAnalyzer = self._import_radonfit_gpu()
+            if readmrc is None:
+                return
             section = self.sectionSpinBox.value()
             self.image = readmrc(self.mrc_file, section=section, mode='gpu')
+            import matplotlib.pyplot as plt
+
             plt.imshow(self.image.get(), cmap='gray')
             plt.show()
 
     def analyze_section(self):
         try:
+            readmrc, RadonAnalyzer = self._import_radonfit_gpu()
+            if readmrc is None or RadonAnalyzer is None:
+                return
             if self.image is None and self.mrc_file:
                 section = self.sectionSpinBox.value()
                 self.image = readmrc(self.mrc_file, section=section, mode='gpu')
@@ -171,6 +203,18 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         elif state == QtCore.Qt.Unchecked:
             self.kappa_template = False
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Membrane Analyzer (Radonfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.kappa_number = self.kappa_num_textedit.text()
         self.kappa_start_value = self.kappa_start_textedit.text()
         self.kappa_end_value = self.kappa_end_textedit.text()
@@ -289,6 +333,18 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
             self.particles_starfile_name = filepath
 
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Membrane Subtraction (Radonfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.mem_analysis_starfile_name = self.membrane_analysis_file_lineEdit.text()
         self.particles_starfile_name = self.particles_selected_starfile_lineEdit.text()
         self.bias = self.Bias_lineEdit.text()
@@ -374,6 +430,18 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
             self.particle = filepath
     
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Micrograph Membrane Subtraction (Radonfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.cpus = self.cpus_lineEdit.text()
         self.batch_size = self.batch_size_lineEdit.text()
         params = ['--particles_selected_filename', f'{self.particle}',

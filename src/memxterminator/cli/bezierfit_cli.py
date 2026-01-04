@@ -7,6 +7,8 @@ import subprocess
 import os
 import json
 
+from ._deps import check_cupy_cuda_available
+
 class MembraneAnalyzer_Bezier_App(QtWidgets.QDialog, Ui_MembraneAnalyzer_Bezierfit):
     PID_FILE = 'process.pid'
     def __init__(self, parent=None):
@@ -65,6 +67,18 @@ class MembraneAnalyzer_Bezier_App(QtWidgets.QDialog, Ui_MembraneAnalyzer_Bezierf
             self.output_filename = filepath
     
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Membrane Analyzer (Bezierfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.template_filename = self.template_lineEdit.text()
         self.particle_filename = self.particle_lineEdit.text()
         self.output_filename = self.output_lineEdit.text()
@@ -173,6 +187,18 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
             self.control_points_filename = filepath
     
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Particle Membrane Subtraction (Bezierfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.template = self.template_lineEdit.text()
         self.particle = self.particle_lineEdit.text()
         self.control_points_filename = self.controlpoints_lineEdit.text()
@@ -251,6 +277,18 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
             self.particle = filepath
     
     def start_process(self):
+        ok, details = check_cupy_cuda_available()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "GPU feature unavailable",
+                (
+                    "Micrograph Membrane Subtraction (Bezierfit) requires a CUDA-capable GPU and CuPy.\n\n"
+                    f"{details}"
+                ),
+            )
+            return
+
         self.particle = self.particle_lineEdit_3.text()
         self.cpus = self.cpus_lineEdit_3.text()
         self.batch_size = self.batch_size_lineEdit_3.text()

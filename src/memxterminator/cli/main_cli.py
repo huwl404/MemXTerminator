@@ -6,17 +6,6 @@ def _run_gui() -> None:
     from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox
 
     from ..GUI.mainwindow_gui import Ui_MainWindow
-    from .radonfit_cli import (
-        MembraneAnalyzerApp,
-        MembraneSubtractionApp,
-        MicrographMembraneSubtraction_Radon_App,
-        RadonApp,
-    )
-    from .bezierfit_cli import (
-        MembraneAnalyzer_Bezier_App,
-        MicrographMembraneSubtraction_Bezier_App,
-        ParticleMembraneSubtraction_Bezier_App,
-    )
 
     class MainWindow(QMainWindow, Ui_MainWindow):
         def __init__(self, parent=None):
@@ -36,7 +25,24 @@ def _run_gui() -> None:
                 self.open_micrograph_membrane_subtraction_bezier
             )
 
+        def _show_feature_import_error(self, feature_name: str, exc: Exception) -> None:
+            QMessageBox.critical(
+                self,
+                "Feature unavailable",
+                (
+                    f"Failed to load '{feature_name}'.\n\n"
+                    "This usually means an optional dependency (e.g. GPU/CUDA libraries) "
+                    "is missing or not usable on this system.\n\n"
+                    f"Details: {type(exc).__name__}: {exc}"
+                ),
+            )
+
         def open_radon_analysis(self):
+            try:
+                from .radonfit_cli import RadonApp
+            except Exception as exc:
+                self._show_feature_import_error("Radon analysis (Radonfit)", exc)
+                return
             self.radon_dialog = RadonApp(self)
             self.radon_dialog.show()
 
@@ -49,6 +55,11 @@ def _run_gui() -> None:
                 QMessageBox.Ok,
             )
             if reply == QMessageBox.Ok:
+                try:
+                    from .radonfit_cli import MembraneAnalyzerApp
+                except Exception as exc:
+                    self._show_feature_import_error("Membrane Analyzer (Radonfit)", exc)
+                    return
                 self.membrane_analyzer_dialog = MembraneAnalyzerApp(self)
                 self.membrane_analyzer_dialog.show()
 
@@ -61,6 +72,11 @@ def _run_gui() -> None:
                 QMessageBox.Ok,
             )
             if reply == QMessageBox.Ok:
+                try:
+                    from .radonfit_cli import MembraneSubtractionApp
+                except Exception as exc:
+                    self._show_feature_import_error("Membrane Subtraction (Radonfit)", exc)
+                    return
                 self.membrane_subtraction_dialog = MembraneSubtractionApp(self)
                 self.membrane_subtraction_dialog.show()
 
@@ -73,12 +89,24 @@ def _run_gui() -> None:
                 QMessageBox.Ok,
             )
             if reply == QMessageBox.Ok:
+                try:
+                    from .radonfit_cli import MicrographMembraneSubtraction_Radon_App
+                except Exception as exc:
+                    self._show_feature_import_error(
+                        "Micrograph Membrane Subtraction (Radonfit)", exc
+                    )
+                    return
                 self.micrograph_membrane_subtraction_dialog = (
                     MicrographMembraneSubtraction_Radon_App(self)
                 )
                 self.micrograph_membrane_subtraction_dialog.show()
 
         def open_membrane_analyzer_bezier(self):
+            try:
+                from .bezierfit_cli import MembraneAnalyzer_Bezier_App
+            except Exception as exc:
+                self._show_feature_import_error("Membrane Analyzer (Bezierfit)", exc)
+                return
             self.membrane_analyzer_bezier_dialog = MembraneAnalyzer_Bezier_App(self)
             self.membrane_analyzer_bezier_dialog.show()
 
@@ -91,6 +119,11 @@ def _run_gui() -> None:
                 QMessageBox.Ok,
             )
             if reply == QMessageBox.Ok:
+                try:
+                    from .bezierfit_cli import ParticleMembraneSubtraction_Bezier_App
+                except Exception as exc:
+                    self._show_feature_import_error("Membrane Subtraction (Bezierfit)", exc)
+                    return
                 self.membrane_subtraction_bezier_dialog = (
                     ParticleMembraneSubtraction_Bezier_App(self)
                 )
@@ -105,6 +138,13 @@ def _run_gui() -> None:
                 QMessageBox.Ok,
             )
             if reply == QMessageBox.Ok:
+                try:
+                    from .bezierfit_cli import MicrographMembraneSubtraction_Bezier_App
+                except Exception as exc:
+                    self._show_feature_import_error(
+                        "Micrograph Membrane Subtraction (Bezierfit)", exc
+                    )
+                    return
                 self.micrograph_membrane_subtraction_bezier_dialog = (
                     MicrographMembraneSubtraction_Bezier_App(self)
                 )
