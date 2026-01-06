@@ -61,9 +61,13 @@ mem_edge_sigma = args.mem_edge_sigma
 
 def get_zoom_factor(particle_starfile_name, templates_starfile_name):
     def get_image_size(starfile_name):
-        df_star = starfile.read(starfile_name)
-        image_sample = df_star['rlnImageName'][0].split('@')[1], int(df_star['rlnImageName'][0].split('@')[0])
-        image_sample_array = readmrc(image_sample[0], section=image_sample[1]-1, mode='gpu')
+        star_tables = read_star_any(starfile_name)
+        _, df_star, image_col = find_star_column(
+            star_tables, candidates=["rlnImageName", "rlnReferenceImage"]
+        )
+        image_ref = df_star[image_col].iloc[0]
+        mrc_path, section0 = parse_relion_image_name(image_ref)
+        image_sample_array = readmrc(mrc_path, section=section0, mode='gpu')
         image_size = image_sample_array.shape[0]
         return image_size
     particle_image_size = get_image_size(particle_starfile_name)
@@ -82,12 +86,16 @@ def get_parameters_for_section(i):
             return None, None, None, None
 
 output_df_star = pd.DataFrame(data=[[0] * 10], columns=['rln2DAverageimageName', 'rlnAveragedMembraneName', 'rlnMembraneMaskName', 'rlnCenterX', 'rlnCenterY', 'rlnAngleTheta', 'rlnMembraneDistance', 'rlnSigma1', 'rlnSigma2', 'rlnCurveKappa'])
-df_templates_star = starfile.read(templates_starfile_name)
-output_df_star = output_df_star.reindex(df_templates_star.index)
+star_tables_templates = read_star_any(templates_starfile_name)
+_, df_templates_star, templates_image_col = find_star_column(
+    star_tables_templates, candidates=["rlnImageName", "rlnReferenceImage"]
+)
+output_df_star = output_df_star.reindex(range(len(df_templates_star)))
 output_df_star.fillna(0, inplace=True)
-output_df_star['rln2DAverageimageName'] = df_templates_star['rlnImageName']
-average_2d_series = df_templates_star['rlnImageName'].apply(lambda x: x.split('@')[1]), df_templates_star['rlnImageName'].apply(lambda x: x.split('@')[0])
-average_2d_lst = list(map(lambda x: (x[0], int(x[1])), list(zip(*average_2d_series))))
+output_df_star['rln2DAverageimageName'] = df_templates_star[templates_image_col]
+average_2d_lst = [
+    parse_relion_image_name(x) for x in df_templates_star[templates_image_col].astype(str).tolist()
+]
 starfile.write(output_df_star, output_filename, overwrite=True)
 
 zoom_factor = get_zoom_factor(particle_starfile_name, templates_starfile_name)
@@ -96,8 +104,8 @@ membrane_masks = []
 averaged_membranes = []
 
 i = 0
-for average2d_filename, section in average_2d_lst:
-    image = readmrc(average2d_filename, section=section-1, mode='gpu')
+for average2d_filename, section0 in average_2d_lst:
+    image = readmrc(average2d_filename, section=section0, mode='gpu')
     image = zoom(image, zoom_factor)
     crop_rate_temp, thr_temp, theta_start_temp, theta_end_temp = get_parameters_for_section(i)
     radonanalyze = RadonAnalyzer(output_filename, i, image, crop_rate=crop_rate_temp, thr=thr_temp, theta_start=theta_start_temp, theta_end=theta_end_temp)
@@ -119,11 +127,10 @@ for average2d_filename, section in average_2d_lst:
     averaged_2d_membrane = cp.asnumpy(averaged_2d_membrane)
     averaged_membranes.append(averaged_2d_membrane)
     output_df_star.loc[i, 'rlnAveragedMembraneName'] = f'''{i+1:06d}@{average2d_filename.replace('.mrc', '_averaged.mrc')}'''
-    print(f'file {average2d_filename} section {section} finished')
+    print(f'file {average2d_filename} section {section0 + 1} finished')
     starfile.write(output_df_star, output_filename, overwrite=True)
     i += 1
 membrane_masks = np.array(membrane_masks)
 averaged_membranes = np.array(averaged_membranes)
 savemrc(membrane_masks, f'''{average_2d_lst[0][0].replace('.mrc', '_masks.mrc')}''')
 savemrc(averaged_membranes, f'''{average_2d_lst[0][0].replace('.mrc', '_averaged.mrc')}''')
-

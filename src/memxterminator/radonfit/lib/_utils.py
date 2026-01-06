@@ -5,6 +5,7 @@ import cupy as cp
 import pandas as pd
 import matplotlib.pyplot as plt
 from cupyx.scipy.ndimage import convolve
+from collections.abc import Mapping
 
 def readmrc(filename, section=0, mode='cpu'):
     image = mrcfile.open(filename)
@@ -69,3 +70,92 @@ def gaussian_kernel(size, sigma=1.0):
     normal = 1 / (2.0 * cp.pi * sigma**2)
     g =  cp.exp(-((x**2 + y**2) / (2.0*sigma**2))) * normal
     return g
+
+
+def read_star_any(path: str) -> dict:
+    """
+    Read a RELION/STAR file and always return a dict of tabular blocks.
+
+    Notes
+    -----
+    - For STAR files with a single data block, `starfile.read()` often returns a
+      `pandas.DataFrame`.
+    - For RELION 3+ STAR files, there can be multiple data blocks (e.g.
+      `data_optics`, `data_particles`), in which case `starfile.read()` may
+      return a dict mapping block name -> `pandas.DataFrame`.
+
+    This helper provides a compatibility layer that:
+    - tries to use `always_dict=True` when supported by the installed `starfile`
+    - otherwise normalises the return type to `dict[str, pandas.DataFrame]`
+    """
+    try:
+        obj = starfile.read(path, always_dict=True)
+    except TypeError:
+        obj = starfile.read(path)
+
+    if isinstance(obj, pd.DataFrame):
+        return {"__single__": obj}
+
+    if isinstance(obj, Mapping):
+        # Some STAR readers may return non-tabular blocks as dicts; we keep only
+        # blocks that can be represented as DataFrames.
+        tables = {}
+        for block_name, block in obj.items():
+            if isinstance(block, pd.DataFrame):
+                tables[block_name] = block
+                continue
+            if isinstance(block, dict):
+                try:
+                    tables[block_name] = pd.DataFrame([block])
+                except Exception:
+                    continue
+        if not tables:
+            raise TypeError(f"No tabular blocks found when reading STAR file: {path}")
+        return tables
+
+    raise TypeError(f"Unsupported return type from starfile.read({path!r}): {type(obj)}")
+
+
+def find_star_column(star_tables: dict, candidates: list[str]):
+    """
+    Find the first STAR block that contains any candidate column.
+
+    Returns
+    -------
+    (block_name, df, column_name)
+    """
+    for block_name, df in star_tables.items():
+        for col in candidates:
+            if col in df.columns:
+                return block_name, df, col
+    available = {block_name: list(df.columns) for block_name, df in star_tables.items()}
+    raise KeyError(
+        "Cannot find any of the candidate columns in the STAR file blocks. "
+        f"candidates={candidates}, available_blocks={list(available.keys())}"
+    )
+
+
+def parse_relion_image_name(image_name: str) -> tuple[str, int]:
+    """
+    Parse a RELION image reference string.
+
+    RELION commonly stores images as `N@path/to/stack.mrcs`, where `N` is a
+    1-based index into the MRC stack. This function returns a tuple of
+    `(mrc_path, section_0based)`.
+    """
+    if pd.isna(image_name):
+        raise ValueError("RELION image reference is NaN/None")
+    s = str(image_name).strip()
+    left, sep, right = s.partition("@")
+    if sep:
+        left = left.strip()
+        right = right.strip()
+        if left == "" or right == "":
+            raise ValueError(f"Invalid RELION image reference (expected N@path): {s!r}")
+        index_1based = int(left)
+        if index_1based < 1:
+            raise ValueError(f"RELION image index must be >= 1, got {index_1based} in {s!r}")
+        return right, index_1based - 1
+
+    # Some STAR files may store direct image paths without an explicit stack index.
+    return s, 0
