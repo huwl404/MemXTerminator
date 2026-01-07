@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from cupyx.scipy.ndimage import convolve
 from collections.abc import Mapping
+from typing import Optional, Tuple
 
 def readmrc(filename, section=0, mode='cpu'):
     image = mrcfile.open(filename)
@@ -159,3 +160,198 @@ def parse_relion_image_name(image_name: str) -> tuple[str, int]:
 
     # Some STAR files may store direct image paths without an explicit stack index.
     return s, 0
+
+
+def parse_relion_image_name_1based(image_name: str) -> tuple[str, int]:
+    """
+    Parse a RELION image reference and return a 1-based index.
+
+    Returns
+    -------
+    (mrc_path, index_1based)
+    """
+    mrc_path, section0 = parse_relion_image_name(image_name)
+    return mrc_path, section0 + 1
+
+
+def _normalise_star_block_name(block_name: str) -> str:
+    name = str(block_name).strip().lower()
+    if name.startswith("data_"):
+        name = name[len("data_"):]
+    return name
+
+
+def get_relion_optics_table(star_tables: Mapping) -> Optional[pd.DataFrame]:
+    """
+    Return the RELION optics table if present (RELION 3.1+), otherwise None.
+    """
+    # Prefer explicit optics block names.
+    for block_name, df in star_tables.items():
+        if isinstance(df, pd.DataFrame) and _normalise_star_block_name(block_name) == "optics":
+            return df
+
+    # Fallback: any block name that contains 'optics'
+    for block_name, df in star_tables.items():
+        if isinstance(df, pd.DataFrame) and "optics" in _normalise_star_block_name(block_name):
+            return df
+
+    # Fallback heuristic: presence of typical optics columns
+    for _, df in star_tables.items():
+        if not isinstance(df, pd.DataFrame):
+            continue
+        if "rlnImagePixelSize" in df.columns and "rlnOpticsGroup" in df.columns:
+            return df
+
+    return None
+
+
+def get_relion_particles_table(star_tables: Mapping, required_columns: Optional[list[str]] = None) -> pd.DataFrame:
+    """
+    Select the most likely per-particle table from a STAR file.
+
+    RELION 3.1+ STAR files often contain multiple blocks such as an optics table
+    and a particles table. This helper picks the appropriate DataFrame.
+    """
+    if required_columns is None:
+        required_columns = ["rlnImageName"]
+
+    tables = [(name, df) for name, df in star_tables.items() if isinstance(df, pd.DataFrame)]
+    if not tables:
+        raise TypeError("No tabular STAR blocks (DataFrames) available")
+    if len(tables) == 1:
+        return tables[0][1]
+
+    candidates = []
+    for block_name, df in tables:
+        cols = set(df.columns)
+        if not all(col in cols for col in required_columns):
+            continue
+
+        score = 0
+        norm_name = _normalise_star_block_name(block_name)
+        if "particles" in norm_name:
+            score += 10_000
+        if "images" in norm_name:
+            score += 1_000
+
+        for col in [
+            "rlnMicrographName",
+            "rlnCoordinateX",
+            "rlnCoordinateY",
+            "rlnAnglePsi",
+            "rlnClassNumber",
+            "rlnOriginX",
+            "rlnOriginY",
+            "rlnOriginXAngst",
+            "rlnOriginYAngst",
+            "rlnOpticsGroup",
+        ]:
+            if col in cols:
+                score += 50
+
+        score += len(cols)
+        candidates.append((score, block_name, df))
+
+    if not candidates:
+        available = {name: list(df.columns) for name, df in tables}
+        raise KeyError(
+            "Cannot find a suitable particles table in STAR blocks. "
+            f"required_columns={required_columns}, available_blocks={list(available.keys())}"
+        )
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][2]
+
+
+def get_relion_image_pixel_size_angstrom(
+    df_particles: pd.DataFrame,
+    star_tables: Optional[Mapping] = None,
+    optics_df: Optional[pd.DataFrame] = None,
+) -> pd.Series:
+    """
+    Return particle image pixel size in Å/pixel as a Series aligned to df_particles.
+
+    This is primarily used to convert origin shifts in Å (`rlnOriginXAngst`) to
+    pixels when RELION 3.1+ writes translation parameters in physical units.
+    """
+    if "rlnImagePixelSize" in df_particles.columns:
+        px = pd.to_numeric(df_particles["rlnImagePixelSize"], errors="coerce")
+        if px.isna().any():
+            raise ValueError("Found NaN in rlnImagePixelSize column")
+        return px
+
+    if optics_df is None and star_tables is not None:
+        optics_df = get_relion_optics_table(star_tables)
+
+    if optics_df is None:
+        raise KeyError(
+            "Cannot convert origin shifts in Å to pixels: optics table not found and "
+            "rlnImagePixelSize is not present in the particles table."
+        )
+
+    if "rlnImagePixelSize" not in optics_df.columns:
+        raise KeyError(
+            "Optics table does not contain rlnImagePixelSize, cannot convert Å shifts to pixels."
+        )
+
+    if "rlnOpticsGroup" in df_particles.columns and "rlnOpticsGroup" in optics_df.columns:
+        pixel_size_map = dict(
+            zip(
+                pd.to_numeric(optics_df["rlnOpticsGroup"], errors="coerce").astype(int),
+                pd.to_numeric(optics_df["rlnImagePixelSize"], errors="coerce").astype(float),
+            )
+        )
+        px = pd.to_numeric(df_particles["rlnOpticsGroup"], errors="coerce").astype(int).map(pixel_size_map)
+        if px.isna().any():
+            raise KeyError(
+                "Some particles have an rlnOpticsGroup that cannot be mapped to optics rlnImagePixelSize."
+            )
+        return px.astype(float)
+
+    if len(optics_df) == 1:
+        px = float(pd.to_numeric(optics_df["rlnImagePixelSize"].iloc[0], errors="coerce"))
+        if not np.isfinite(px) or px <= 0:
+            raise ValueError(f"Invalid rlnImagePixelSize value in optics table: {px!r}")
+        return pd.Series(px, index=df_particles.index, dtype=float)
+
+    raise KeyError(
+        "Multiple optics groups present but particles table has no rlnOpticsGroup column."
+    )
+
+
+def get_relion_origin_shifts_pixels(
+    df_particles: pd.DataFrame,
+    star_tables: Optional[Mapping] = None,
+    optics_df: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Return (origin_x_pix, origin_y_pix) as pixel units for a RELION particles table.
+
+    Supports both:
+    - `rlnOriginX` / `rlnOriginY` (pixels)
+    - `rlnOriginXAngst` / `rlnOriginYAngst` (Å), converted using `rlnImagePixelSize`
+    """
+    if "rlnOriginX" in df_particles.columns and "rlnOriginY" in df_particles.columns:
+        dx = pd.to_numeric(df_particles["rlnOriginX"], errors="coerce").fillna(0.0)
+        dy = pd.to_numeric(df_particles["rlnOriginY"], errors="coerce").fillna(0.0)
+        return dx, dy
+
+    angst_pairs = [
+        ("rlnOriginXAngst", "rlnOriginYAngst"),
+        ("rlnOriginXAngstrom", "rlnOriginYAngstrom"),
+    ]
+    for col_x, col_y in angst_pairs:
+        if col_x in df_particles.columns and col_y in df_particles.columns:
+            dx_a = pd.to_numeric(df_particles[col_x], errors="coerce").fillna(0.0)
+            dy_a = pd.to_numeric(df_particles[col_y], errors="coerce").fillna(0.0)
+            px = get_relion_image_pixel_size_angstrom(
+                df_particles, star_tables=star_tables, optics_df=optics_df
+            )
+            if (px <= 0).any():
+                raise ValueError("Found non-positive pixel size while converting Å shifts to pixels")
+            return dx_a / px, dy_a / px
+
+    raise KeyError(
+        "Cannot find origin shift columns: expected either (rlnOriginX, rlnOriginY) in pixels "
+        "or (rlnOriginXAngst, rlnOriginYAngst) in Å."
+    )

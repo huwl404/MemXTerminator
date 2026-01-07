@@ -9,10 +9,18 @@ import multiprocessing
 from multiprocessing import Pool
 from setproctitle import setproctitle
 import time
+from ..lib._utils import read_star_any, get_relion_particles_table, parse_relion_image_name_1based
 
 class MicrographMembraneSubtract:
     def __init__(self, particles_selected_filename):
-        self.df_star = starfile.read(particles_selected_filename)
+        star_tables_particles = read_star_any(particles_selected_filename)
+        self.df_star = get_relion_particles_table(star_tables_particles)
+
+        parsed = [parse_relion_image_name_1based(x) for x in self.df_star["rlnImageName"].tolist()]
+        self.df_star = self.df_star.copy()
+        self.df_star["_memx_stack_path"] = [p for p, _ in parsed]
+        self.df_star["_memx_section_1based"] = [i for _, i in parsed]
+
         self.rawimage_stacks_name_lst = self.get_rawimage_stacks_name_lst()
         self.subtracted_stacks_name_lst = self.get_subtracted_stacks_name_lst()
         self.micrograph_name_lst = self.get_MicrographName_lst()
@@ -26,7 +34,7 @@ class MicrographMembraneSubtract:
         self.mask = cp.ones((self.rawimage_size, self.rawimage_size))
 
     def get_rawimage_stacks_name_lst(self):
-        rawimage_lst = list(self.df_star['rlnImageName'].apply(lambda x: x.split('@')[1]))
+        rawimage_lst = list(self.df_star["_memx_stack_path"])
         rawimage_name_lst = list(dict.fromkeys(rawimage_lst))
         return rawimage_name_lst
     def get_subtracted_stacks_name_lst(self):
@@ -40,10 +48,10 @@ class MicrographMembraneSubtract:
             exit()
         return micrograph_name_lst
     def get_df_temp(self, rawimage_stacks_name):
-        df_temp = self.df_star[self.df_star['rlnImageName'].apply(lambda x: x.split('@')[1]) == rawimage_stacks_name]
+        df_temp = self.df_star[self.df_star["_memx_stack_path"] == rawimage_stacks_name]
         return df_temp
     def get_df_temp_X_Y(self, df_temp):
-        rawimage_sections_lst = list(map(lambda x: int(x), list(df_temp['rlnImageName'].apply(lambda x: x.split('@')[0]))))
+        rawimage_sections_lst = list(map(int, list(df_temp["_memx_section_1based"])))
         CoordinateX_lst = list(df_temp['rlnCoordinateX'])
         CoordinateY_lst = list(df_temp['rlnCoordinateY'])
         zip_lst = list(zip(CoordinateX_lst, CoordinateY_lst))
