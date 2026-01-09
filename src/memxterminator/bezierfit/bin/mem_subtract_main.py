@@ -1,59 +1,57 @@
-from cryosparc.dataset import Dataset
-import numpy as np
-import cupy as cp
-from cupyx.scipy.ndimage import zoom
-import glob
+from __future__ import annotations
+
+import argparse
 import json
 import os
-import mrcfile
+import socket
 import time
-import multiprocessing
-import argparse
+import traceback
+from datetime import datetime, timezone
+
+import cupy as cp
+import mrcfile
+import numpy as np
+from cryosparc.dataset import Dataset
 from setproctitle import setproctitle
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--particle', type=str, default='./particles_selected.cs')
-parser.add_argument('--template', type=str, default='./templates_selected.cs')
-parser.add_argument('--control_points', type=str, default='./control_points.json')
-parser.add_argument('--points_step', type=float, default=0.005)
-parser.add_argument('--physical_membrane_dist', type=int, default=35)
+from memxterminator.mxt_state import (
+    compute_params_hash,
+    fingerprint_file,
+    is_uptodate,
+    read_mxt,
+    release_lock,
+    to_subtracted_stack_path,
+    try_acquire_lock,
+    write_json_atomic,
+    write_mrc_atomic,
+)
 
-args = parser.parse_args()
-
-particle_dset = Dataset.load(args.particle)
-particle_filenames_list = np.array(particle_dset['blob/path'])
-particle_idx_list = np.array(particle_dset['blob/idx'])
-psi_list = np.array(particle_dset['alignments2D/pose'])
-pixel_size_list = np.array(particle_dset['blob/psize_A'])
-shift_list = np.array(particle_dset['alignments2D/shift'])
-class_list = np.array(particle_dset['alignments2D/class'])
-
-template_dset = Dataset.load(args.template)
-template_shape = np.array(template_dset['blob/shape'])[0]
-particle_shape = np.array(particle_dset['blob/shape'])[0]
+from ..lib.subtraction import MembraneSubtract
 
 
-def get_folder_path_list(particle_filenames_list):
-    folder_path_list = []
-    for particle_filename in particle_filenames_list:
-        folder_path_list.append(os.path.dirname(particle_filename))
-    return folder_path_list
+def _append_event_log(level: str, event: str, **fields: object) -> None:
+    """
+    Append a single human-readable line to `bezfit_pms_run_data.log`.
 
-def mkdir_subtracted_folder_path(folder_path_list):
-    folder_path_list_norepeat = list(set(folder_path_list))
-    subtracted_folder_path_list = []
-    for folder_path in folder_path_list_norepeat:
-        subtracted_folder_path_list.append(folder_path.replace('extract', 'subtracted'))
-    
-    for subtracted_folder_path in subtracted_folder_path_list:
-        os.makedirs(subtracted_folder_path,exist_ok=True)
+    This file is never read for resume; `.mxt` is authoritative (Spec v1).
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    parts = [ts, level, event]
+    for key, value in fields.items():
+        try:
+            encoded = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            encoded = repr(value)
+        parts.append(f"{key}={encoded}")
 
-mkdir_subtracted_folder_path(get_folder_path_list(particle_filenames_list))
-# read 'control_points.json' file into a dictionary
-with open(args.control_points, 'r') as f:
-    control_points_dict = json.load(f)
-# name_pattern = '*.mrc'
-# file_name_list = glob.glob(f'{folder_path}/{name_pattern}')
+    line = " ".join(parts)
+    try:
+        with open("bezfit_pms_run_data.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Best-effort: logging must never crash workers.
+        pass
+
 
 def fill_nan_with_gaussian_noise(image):
     image_copy = image.copy()
@@ -64,82 +62,406 @@ def fill_nan_with_gaussian_noise(image):
     image_copy[nan_mask] = noise[nan_mask]
     return image_copy
 
-def membrane_subtract(particle_filename):
-    from ..lib.subtraction import MembraneSubtract
-    setproctitle('MemXTerminator-bezPMS')
-    start_time = time.time()
-    with mrcfile.open(particle_filename, permissive=True) as mrc:
-        particle_stack = mrc.data
-    particle_stack = cp.array(particle_stack)
-    # particle_stack = particle_stack.get()
-    subtracted_particle_stack = particle_stack.copy()
-    mask = (particle_filenames_list == particle_filename)
-    particle_idxes = particle_idx_list[mask]
-    psis = psi_list[mask]
-    pixel_sizes = pixel_size_list[mask]
-    shifts = shift_list[mask]
-    classes = class_list[mask]
-    for particle_idx, psi, pixel_size, shift, class_ in zip(particle_idxes, psis, pixel_sizes, shifts, classes):
-        # if str(class_) in control_points_dict:
-        control_points = np.array(control_points_dict[str(class_)])
-        # print(control_points)
-        # print(f'particle_filename:{particle_filename}, particle_index:{particle_idx}, psi: {psi}, pixel_size: {pixel_size}, shift: {shift}, class: {class_}')
-        if particle_stack.ndim == 2:
-            subtractor = MembraneSubtract(control_points, particle_stack, psi, shift[0], shift[1], pixel_size, args.points_step, args.physical_membrane_dist)
-            subtracted_particle_stack = subtractor.mem_subtract()
-            if cp.isnan(subtracted_particle_stack).any():
-                subtracted_particle_stack = fill_nan_with_gaussian_noise(subtracted_particle_stack)
-        elif particle_stack.ndim == 3:
-            subtractor = MembraneSubtract(control_points, particle_stack[particle_idx], psi, shift[0], shift[1], pixel_size, args.points_step, args.physical_membrane_dist)
-            subtracted_particle = subtractor.mem_subtract()
-            if cp.isnan(subtracted_particle).any():
-                subtracted_particle = fill_nan_with_gaussian_noise(subtracted_particle)
-            subtracted_particle_stack[particle_idx] = subtracted_particle
-        # print(f'{particle_idx}@{particle_filename} finished')
-    # subtracted_particle_stack = cp.array(subtracted_particle_stack)
-    # subtracted_particle_stack = subtracted_particle_stack.get()
-    with mrcfile.new(particle_filename.replace('/extract/', '/subtracted/').replace('.mrc', '_subtracted.mrc'), overwrite=True) as mrc:
-        mrc.set_data(subtracted_particle_stack.get())
-    end_time = time.time()
-    with open('bezfit_pms_run_data.log', 'a') as f:
-        f.write(particle_filename + '\n')
-    print(f'>>> {particle_filename}, {len(particle_idxes)} particles finished in {end_time - start_time} seconds.')
-    del subtracted_particle_stack
-    del particle_stack
-    del MembraneSubtract
-    del mrc
-    # release memory
-    cp.cuda.MemoryPool().free_all_blocks()
 
-def remove_duplicates_preserve_order(seq):
+def _remove_duplicates_preserve_order(seq: list[str]) -> list[str]:
     return list(dict.fromkeys(seq))
 
-def process_membrane_subtract(file_name_list):
-    file_name_list = remove_duplicates_preserve_order(file_name_list)
-    print('>>> Preparing Beizerfit Particle Membrane Subtraction dataset...')
-    if not os.path.exists('bezfit_pms_run_data.log'):
-        with open('bezfit_pms_run_data.log', 'w') as f:
-            f.write('')
-        print('>>> Did not find bezierfit pms history. Creating a new bezfit_pms_run_data.log file.')
-    with open('bezfit_pms_run_data.log', 'r') as file:
-        finished_bezfit_particles_lst = [line.rstrip('\n') for line in file]
-    print(f'>>> Found {len(file_name_list)} raw particle stacks in total.')
-    for rawimage_particle_name in file_name_list:
-        if rawimage_particle_name[1] in finished_bezfit_particles_lst:
-            file_name_list.remove(rawimage_particle_name)
-        else:
-            pass
-    print(f'>>> Found {len(finished_bezfit_particles_lst)} finished particle stacks in bezfit_pms_run_data.log file. Removing them...')
-    print(f'>>> {len(file_name_list)-len(finished_bezfit_particles_lst)} particle stacks left to process.')
-    for file_name in file_name_list:
-        membrane_subtract(file_name)
+
+class BezierfitParticleMembraneSubtract:
+    def __init__(
+        self,
+        *,
+        particle_cs: str,
+        template_cs: str,
+        control_points_json: str,
+        points_step: float,
+        physical_membrane_dist: int,
+        resume: bool = True,
+        force: bool = False,
+        adopt_existing_outputs: bool = False,
+        skip_failed: bool = False,
+        strict_output_check: bool = True,
+    ):
+        self.particle_cs = particle_cs
+        self.template_cs = template_cs
+        self.control_points_json = control_points_json
+
+        self.resume = bool(resume)
+        self.force = bool(force)
+        self.adopt_existing_outputs = bool(adopt_existing_outputs)
+        self.skip_failed = bool(skip_failed)
+        self.strict_output_check = bool(strict_output_check)
+
+        self.mxt_task = "bezierfit_particle_pms"
+        self.mxt_params = {
+            "points_step": float(points_step),
+            "physical_membrane_dist": int(physical_membrane_dist),
+        }
+        self.mxt_params_hash = compute_params_hash(self.mxt_params)
+
+        self._host = socket.gethostname()
+        try:
+            import memxterminator  # noqa: WPS433 (local import by design)
+
+            self._software_version = getattr(memxterminator, "__version__", "unknown")
+        except Exception:
+            self._software_version = "unknown"
+
+        self._particles_cs_fp = fingerprint_file(self.particle_cs)
+        self._templates_cs_fp = fingerprint_file(self.template_cs)
+        self._control_points_fp = fingerprint_file(self.control_points_json)
+
+        particle_dset = Dataset.load(self.particle_cs)
+        # Ensure stable string dtype even if CryoSPARC returns bytes-like objects.
+        self._particle_filenames = np.asarray(particle_dset["blob/path"]).astype(str)
+        self._particle_idx = np.asarray(particle_dset["blob/idx"])
+        self._psi = np.asarray(particle_dset["alignments2D/pose"])
+        self._pixel_size = np.asarray(particle_dset["blob/psize_A"])
+        self._shift = np.asarray(particle_dset["alignments2D/shift"])
+        self._class = np.asarray(particle_dset["alignments2D/class"])
+
+        with open(self.control_points_json, "r", encoding="utf-8") as f:
+            self._control_points_dict = json.load(f)
+
+        unique_stacks = _remove_duplicates_preserve_order(self._particle_filenames.tolist())
+        self.particle_stack_paths = unique_stacks
+
+    def _output_passes_sanity_check(self, out_stack: str) -> bool:
+        """
+        Minimal output sanity check for `--adopt_existing_outputs`.
+        """
+        try:
+            with mrcfile.open(out_stack, permissive=True) as mrc:
+                shape = getattr(mrc, "data", None).shape
+            return bool(shape) and all(int(x) > 0 for x in shape)
+        except Exception:
+            return False
+
+    def _build_mxt_object(
+        self,
+        *,
+        status: str,
+        out_stack: str,
+        expected_inputs: dict,
+        started_utc: str,
+        finished_utc: str,
+        duration_sec: float,
+        adopted: bool,
+        run_id: str,
+        error=None,
+    ) -> dict:
+        output_obj: dict[str, object] = {"path": out_stack}
+        if os.path.exists(out_stack):
+            try:
+                output_obj["file"] = fingerprint_file(out_stack)
+            except Exception:
+                pass
+
+        obj = {
+            "mxt_schema": 1,
+            "task": self.mxt_task,
+            "status": status,
+            "params": self.mxt_params,
+            "params_hash": self.mxt_params_hash,
+            "inputs": expected_inputs,
+            "output": output_obj,
+            "run": {
+                "run_id": run_id,
+                "started_utc": started_utc,
+                "finished_utc": finished_utc,
+                "duration_sec": float(duration_sec),
+                "pid": int(os.getpid()),
+                "host": self._host,
+                "software_version": self._software_version,
+                "git_commit": None,
+            },
+            "adopted": bool(adopted),
+        }
+        if error is not None:
+            obj["error"] = error
+        return obj
+
+    def process_particle_stack(self, particle_filename: str) -> None:
+        setproctitle("MemXTerminator-bezPMS")
+
+        raw_stack = particle_filename
+        out_stack = to_subtracted_stack_path(raw_stack)
+        mxt_path = out_stack + ".mxt"
+        lock_path = mxt_path + ".lock"
+
+        expected_inputs = {
+            "raw_stack": fingerprint_file(raw_stack),
+            "particles_cs": self._particles_cs_fp,
+            "templates_cs": self._templates_cs_fp,
+            "control_points_json": self._control_points_fp,
+        }
+
+        # Fast-path: skip without locking.
+        if (not self.force) and self.resume:
+            uptodate, reason = is_uptodate(
+                out_stack,
+                mxt_path,
+                self.mxt_task,
+                self.mxt_params_hash,
+                expected_inputs,
+                strict_output_check=self.strict_output_check,
+            )
+            if uptodate:
+                print(f">>> SKIP_UPTODATE {raw_stack} -> {out_stack}")
+                _append_event_log("INFO", "SKIP_UPTODATE", raw_stack=raw_stack, out_stack=out_stack)
+                return
+
+            if self.skip_failed and os.path.exists(mxt_path):
+                try:
+                    mxt = read_mxt(mxt_path)
+                    if (
+                        mxt.get("task") == self.mxt_task
+                        and mxt.get("status") == "failed"
+                        and mxt.get("params_hash") == self.mxt_params_hash
+                    ):
+                        print(f">>> SKIP_FAILED {raw_stack} -> {out_stack}")
+                        _append_event_log("WARN", "SKIP_FAILED", raw_stack=raw_stack, out_stack=out_stack)
+                        return
+                except Exception:
+                    pass
+
+            if (
+                self.adopt_existing_outputs
+                and reason in {"MISSING_MXT", "INVALID_MXT_JSON"}
+                and os.path.exists(out_stack)
+                and self._output_passes_sanity_check(out_stack)
+            ):
+                now = datetime.now(timezone.utc).isoformat()
+                adopt_run_id = f"{now}-{os.getpid()}-adopt"
+                obj = self._build_mxt_object(
+                    status="success",
+                    out_stack=out_stack,
+                    expected_inputs=expected_inputs,
+                    started_utc=now,
+                    finished_utc=now,
+                    duration_sec=0.0,
+                    adopted=True,
+                    run_id=adopt_run_id,
+                    error=None,
+                )
+                write_json_atomic(mxt_path, obj)
+                print(f">>> ADOPT_EXISTING_OUTPUT {raw_stack} -> {out_stack}")
+                _append_event_log(
+                    "INFO",
+                    "ADOPT_EXISTING_OUTPUT",
+                    raw_stack=raw_stack,
+                    out_stack=out_stack,
+                    run_id=adopt_run_id,
+                )
+                return
+
+        run_id = f"{datetime.now(timezone.utc).isoformat()}-{os.getpid()}"
+        if not try_acquire_lock(lock_path, run_id=run_id):
+            print(f">>> LOCKED_SKIP {raw_stack} -> {out_stack}")
+            _append_event_log("INFO", "LOCKED_SKIP", raw_stack=raw_stack, out_stack=out_stack)
+            return
+
+        started_wall = time.time()
+        started_utc = datetime.now(timezone.utc).isoformat()
+        _append_event_log(
+            "INFO",
+            "START",
+            raw_stack=raw_stack,
+            out_stack=out_stack,
+            run_id=run_id,
+            params_hash=self.mxt_params_hash,
+        )
+        try:
+            # Re-check under lock to avoid duplicate work when two processes race.
+            if (not self.force) and self.resume:
+                uptodate, _reason2 = is_uptodate(
+                    out_stack,
+                    mxt_path,
+                    self.mxt_task,
+                    self.mxt_params_hash,
+                    expected_inputs,
+                    strict_output_check=self.strict_output_check,
+                )
+                if uptodate:
+                    print(f">>> SKIP_UPTODATE {raw_stack} -> {out_stack}")
+                    _append_event_log("INFO", "SKIP_UPTODATE", raw_stack=raw_stack, out_stack=out_stack, run_id=run_id)
+                    return
+
+            with mrcfile.open(raw_stack, permissive=True) as mrc:
+                particle_stack = cp.asarray(mrc.data)
+
+            subtracted_particle_stack = particle_stack.copy()
+            mask = self._particle_filenames == raw_stack
+            particle_idxes = self._particle_idx[mask]
+            psis = self._psi[mask]
+            pixel_sizes = self._pixel_size[mask]
+            shifts = self._shift[mask]
+            classes = self._class[mask]
+
+            for particle_idx, psi, pixel_size, shift, class_ in zip(
+                particle_idxes, psis, pixel_sizes, shifts, classes
+            ):
+                class_key = str(int(class_))
+                control_points = np.array(self._control_points_dict[class_key])
+
+                if particle_stack.ndim == 2:
+                    subtractor = MembraneSubtract(
+                        control_points,
+                        particle_stack,
+                        psi,
+                        shift[0],
+                        shift[1],
+                        pixel_size,
+                        self.mxt_params["points_step"],
+                        self.mxt_params["physical_membrane_dist"],
+                    )
+                    subtracted_particle_stack = subtractor.mem_subtract()
+                    if cp.isnan(subtracted_particle_stack).any():
+                        subtracted_particle_stack = fill_nan_with_gaussian_noise(subtracted_particle_stack)
+                elif particle_stack.ndim == 3:
+                    idx = int(particle_idx)
+                    subtractor = MembraneSubtract(
+                        control_points,
+                        particle_stack[idx],
+                        psi,
+                        shift[0],
+                        shift[1],
+                        pixel_size,
+                        self.mxt_params["points_step"],
+                        self.mxt_params["physical_membrane_dist"],
+                    )
+                    subtracted_particle = subtractor.mem_subtract()
+                    if cp.isnan(subtracted_particle).any():
+                        subtracted_particle = fill_nan_with_gaussian_noise(subtracted_particle)
+                    subtracted_particle_stack[idx] = subtracted_particle
+                else:
+                    raise ValueError(f"Unsupported particle stack ndim={particle_stack.ndim} for {raw_stack}")
+
+                del subtractor
+                cp.cuda.Stream.null.synchronize()
+                cp.cuda.MemoryPool().free_all_blocks()
+
+            # Atomic output write + `.mxt` sidecar (Spec v1).
+            write_mrc_atomic(out_stack, subtracted_particle_stack)
+            print(f">>> {out_stack} saved")
+
+            finished_utc = datetime.now(timezone.utc).isoformat()
+            duration = time.time() - started_wall
+            obj = self._build_mxt_object(
+                status="success",
+                out_stack=out_stack,
+                expected_inputs=expected_inputs,
+                started_utc=started_utc,
+                finished_utc=finished_utc,
+                duration_sec=duration,
+                adopted=False,
+                run_id=run_id,
+                error=None,
+            )
+            write_json_atomic(mxt_path, obj)
+            _append_event_log(
+                "INFO",
+                "SUCCESS",
+                raw_stack=raw_stack,
+                out_stack=out_stack,
+                run_id=run_id,
+                duration_sec=duration,
+            )
+
+            del subtracted_particle_stack
+            del particle_stack
+            cp.cuda.Stream.null.synchronize()
+            cp.cuda.MemoryPool().free_all_blocks()
+        except Exception as exc:
+            finished_utc = datetime.now(timezone.utc).isoformat()
+            duration = time.time() - started_wall
+            tb = traceback.format_exc()
+            if len(tb) > 20_000:
+                tb = tb[:20_000] + "\n... (truncated) ..."
+            error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": tb,
+            }
+            try:
+                obj = self._build_mxt_object(
+                    status="failed",
+                    out_stack=out_stack,
+                    expected_inputs=expected_inputs,
+                    started_utc=started_utc,
+                    finished_utc=finished_utc,
+                    duration_sec=duration,
+                    adopted=False,
+                    run_id=run_id,
+                    error=error,
+                )
+                write_json_atomic(mxt_path, obj)
+            except Exception:
+                pass
+            _append_event_log(
+                "ERROR",
+                "FAILED",
+                raw_stack=raw_stack,
+                out_stack=out_stack,
+                run_id=run_id,
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            release_lock(lock_path)
 
 
-process_membrane_subtract(particle_filenames_list)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--particle", type=str, default="./particles_selected.cs")
+    parser.add_argument("--template", type=str, default="./templates_selected.cs")
+    parser.add_argument("--control_points", type=str, default="./control_points.json")
+    parser.add_argument("--points_step", type=float, default=0.005)
+    parser.add_argument("--physical_membrane_dist", type=int, default=35)
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable resume via per-output .mxt sidecars (default: enabled).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force recompute even if .mxt indicates the output is up-to-date.",
+    )
+    parser.add_argument(
+        "--adopt_existing_outputs",
+        action="store_true",
+        default=False,
+        help="If output exists but .mxt is missing/invalid, write an adopted .mxt and skip recompute.",
+    )
+    parser.add_argument(
+        "--skip_failed",
+        action="store_true",
+        default=False,
+        help="Skip items whose existing .mxt has status=failed for the current params_hash.",
+    )
 
-# def multiprocess_membrane_subtract(file_name_list, num_cpu):
-#     pool = multiprocessing.Pool(processes=num_cpu)
-#     pool.map(membrane_subtract, file_name_list)
-#     pool.close()
-#     pool.join()
+    args = parser.parse_args()
 
+    runner = BezierfitParticleMembraneSubtract(
+        particle_cs=args.particle,
+        template_cs=args.template,
+        control_points_json=args.control_points,
+        points_step=args.points_step,
+        physical_membrane_dist=args.physical_membrane_dist,
+        resume=args.resume,
+        force=args.force,
+        adopt_existing_outputs=args.adopt_existing_outputs,
+        skip_failed=args.skip_failed,
+    )
+
+    print(">>> Preparing Bezierfit Particle Membrane Subtraction dataset...")
+    print(f">>> Found {len(runner.particle_stack_paths)} raw particle stacks in total.")
+    for stack_path in runner.particle_stack_paths:
+        runner.process_particle_stack(stack_path)
+
+
+if __name__ == "__main__":
+    main()
