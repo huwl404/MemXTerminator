@@ -6,6 +6,8 @@ from ..GUI.MicrographMembraneSubtraction_Bezierfit import Ui_MicrographMembraneS
 import subprocess
 import os
 import json
+import shlex
+import sys
 
 from ._deps import check_cupy_cuda_available
 
@@ -106,7 +108,13 @@ class MembraneAnalyzer_Bezier_App(QtWidgets.QDialog, Ui_MembraneAnalyzer_Bezierf
             '--refine_cpus', f'{int(self.refine_cpus)}']
         
         with open('run.out', 'w') as f:
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.bezierfit.bin.mem_analyze_main'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = [sys.executable, '-u', '-m', 'memxterminator.bezierfit.bin.mem_analyze_main'] + params
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Bezier Membrane Analysis started with PID:", self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
@@ -160,6 +168,11 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
         self.check_running_process()
         self.launch_pushButton.clicked.connect(self.start_process)
         self.kill_pushButton.clicked.connect(self.kill_process)
+
+        self.show_command_pushButton = QtWidgets.QPushButton("Command...", self.horizontalLayoutWidget)
+        self.show_command_pushButton.setToolTip("Show the exact CLI command that will be executed.")
+        self.horizontalLayout.insertWidget(1, self.show_command_pushButton)
+        self.show_command_pushButton.clicked.connect(self.show_command)
         
         with open('run.out', 'a') as f:
             f.write(f"Bezier Particle Membrane Subtraction ready.\n")
@@ -185,6 +198,40 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
         if filepath:
             self.controlpoints_lineEdit.setText(filepath)
             self.control_points_filename = filepath
+
+    def _build_cmd(self, *, coerce_numbers: bool) -> list[str]:
+        template = self.template_lineEdit.text()
+        particle = self.particle_lineEdit.text()
+        control_points = self.controlpoints_lineEdit.text()
+        physical_membrane_dist = self.physical_membrane_dist_lineEdit.text()
+        points_step = self.points_step_lineEdit.text()
+
+        if coerce_numbers:
+            physical_membrane_dist = str(int(physical_membrane_dist))
+            points_step = str(float(points_step))
+
+        params = [
+            "--template",
+            template,
+            "--particle",
+            particle,
+            "--control_points",
+            control_points,
+            "--physical_membrane_dist",
+            physical_membrane_dist,
+            "--points_step",
+            points_step,
+        ]
+        return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.mem_subtract_main"] + params
+
+    def show_command(self) -> None:
+        from ._command_preview import CommandPreviewDialog
+
+        try:
+            cmd = self._build_cmd(coerce_numbers=True)
+        except Exception:
+            cmd = self._build_cmd(coerce_numbers=False)
+        CommandPreviewDialog(cmd, self).exec_()
     
     def start_process(self):
         ok, details = check_cupy_cuda_available()
@@ -199,18 +246,14 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
             )
             return
 
-        self.template = self.template_lineEdit.text()
-        self.particle = self.particle_lineEdit.text()
-        self.control_points_filename = self.controlpoints_lineEdit.text()
-        self.physical_membrane_dist = self.physical_membrane_dist_lineEdit.text()
-        self.points_step = self.points_step_lineEdit.text()
-        params = ['--template', f'{self.template}',
-            '--particle', f'{self.particle}',
-            '--control_points', f'{self.control_points_filename}',
-            '--physical_membrane_dist', f'{int(self.physical_membrane_dist)}',
-            '--points_step', f'{float(self.points_step)}']
         with open('run.out', 'w') as f:
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.bezierfit.bin.mem_subtract_main'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = self._build_cmd(coerce_numbers=True)
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Bezier Particle Membrane Subtraction started with PID:", self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
@@ -261,6 +304,11 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
         self.check_running_process()
         self.launch_pushButton_3.clicked.connect(self.start_process)
         self.kill_pushButton_3.clicked.connect(self.kill_process)
+
+        self.show_command_pushButton = QtWidgets.QPushButton("Command...", self.horizontalLayoutWidget_2)
+        self.show_command_pushButton.setToolTip("Show the exact CLI command that will be executed.")
+        self.horizontalLayout_6.insertWidget(1, self.show_command_pushButton)
+        self.show_command_pushButton.clicked.connect(self.show_command)
         
         with open('run.out', 'a') as f:
             f.write(f"Micrograph Membrane Subtraction ready.\nPlease ensure that you have converted the particles_selected.cs file to particles_selected.star file.\n")
@@ -275,6 +323,27 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
         if filepath:
             self.particle_lineEdit_3.setText(filepath)
             self.particle = filepath
+
+    def _build_cmd(self, *, coerce_numbers: bool) -> list[str]:
+        particle_star = self.particle_lineEdit_3.text()
+        cpus = self.cpus_lineEdit_3.text()
+        batch_size = self.batch_size_lineEdit_3.text()
+
+        if coerce_numbers:
+            cpus = str(int(cpus))
+            batch_size = str(int(batch_size))
+
+        params = ["--particle", particle_star, "--cpu", cpus, "--batch_size", batch_size]
+        return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.micrograph_mem_subtract_main"] + params
+
+    def show_command(self) -> None:
+        from ._command_preview import CommandPreviewDialog
+
+        try:
+            cmd = self._build_cmd(coerce_numbers=True)
+        except Exception:
+            cmd = self._build_cmd(coerce_numbers=False)
+        CommandPreviewDialog(cmd, self).exec_()
     
     def start_process(self):
         ok, details = check_cupy_cuda_available()
@@ -289,14 +358,14 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
             )
             return
 
-        self.particle = self.particle_lineEdit_3.text()
-        self.cpus = self.cpus_lineEdit_3.text()
-        self.batch_size = self.batch_size_lineEdit_3.text()
-        params = ['--particle', f'{self.particle}',
-            '--cpu', f'{int(self.cpus)}',
-            '--batch_size', f'{int(self.batch_size)}']
         with open('run.out', 'w') as f:
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.bezierfit.bin.micrograph_mem_subtract_main'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = self._build_cmd(coerce_numbers=True)
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
         print(f'Micrograph Membrane Subtraction started using {self.cpus} CPUs and batch size of {self.batch_size}')
         with open(self.PID_FILE, 'w') as f:

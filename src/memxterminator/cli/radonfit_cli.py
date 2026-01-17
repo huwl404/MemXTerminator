@@ -8,6 +8,8 @@ import os
 import json
 import mrcfile
 import subprocess
+import shlex
+import sys
 
 from ._deps import check_cupy_cuda_available
 
@@ -253,7 +255,13 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
 
         with open('run.out', 'w') as f:
             # self.process = subprocess.Popen(['python','-u', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'membrane_analysis-main.py')] + params, stdout=f, stderr=subprocess.STDOUT)
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.radonfit.bin.membrane_analysis-main'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = [sys.executable, '-u', '-m', 'memxterminator.radonfit.bin.membrane_analysis-main'] + params
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Radonfit Membrane Analysis started with PID:", self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
@@ -311,6 +319,11 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.check_running_process()
         self.launch_button.clicked.connect(self.start_process)
         self.kill_button.clicked.connect(self.kill_process)
+
+        self.show_command_button = QtWidgets.QPushButton("Command...", self.horizontalLayoutWidget)
+        self.show_command_button.setToolTip("Show the exact CLI command that will be executed.")
+        self.horizontalLayout.insertWidget(1, self.show_command_button)
+        self.show_command_button.clicked.connect(self.show_command)
         
         with open('run.out', 'a') as f:
             f.write(f"Radonfit Membrane Subtraction ready.\n")
@@ -331,6 +344,34 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         if filepath:
             self.particles_selected_starfile_lineEdit.setText(filepath)
             self.particles_starfile_name = filepath
+
+    def _build_cmd(self) -> list[str]:
+        params = [
+            "--particles_selected_filename",
+            self.particles_selected_starfile_lineEdit.text(),
+            "--membrane_analysis_filename",
+            self.membrane_analysis_file_lineEdit.text(),
+            "--bias",
+            self.Bias_lineEdit.text(),
+            "--extra_mem_dist",
+            self.Extra_mem_dist_lineEdit.text(),
+            "--scaling_factor_start",
+            self.Scaling_factor_start_lineEdit.text(),
+            "--scaling_factor_end",
+            self.Scaling_factor_end_lineEdit.text(),
+            "--scaling_factor_step",
+            self.Step_lineEdit.text(),
+            "--cpu",
+            self.CPU_lineEdit.text(),
+            "--batch_size",
+            self.Batch_size_lineEdit.text(),
+        ]
+        return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.membrane_subtract-main"] + params
+
+    def show_command(self) -> None:
+        from ._command_preview import CommandPreviewDialog
+
+        CommandPreviewDialog(self._build_cmd(), self).exec_()
 
     def start_process(self):
         ok, details = check_cupy_cuda_available()
@@ -354,17 +395,14 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.scaling_factor_step = self.Step_lineEdit.text()
         self.cpu = self.CPU_lineEdit.text()
         self.batch_size = self.Batch_size_lineEdit.text()
-        params = ['--particles_selected_filename', f'{self.particles_starfile_name}',
-                  '--membrane_analysis_filename', f'{self.mem_analysis_starfile_name}',
-                  '--bias', f'{self.bias}',
-                  '--extra_mem_dist', f'{self.extra_mem_dist}',
-                  '--scaling_factor_start', f'{self.scaling_factor_start}',
-                  '--scaling_factor_end', f'{self.scaling_factor_end}',
-                  '--scaling_factor_step', f'{self.scaling_factor_step}',
-                  '--cpu', f'{self.cpu}',
-                  '--batch_size', f'{self.batch_size}']
         with open('run.out', 'w') as f:
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.radonfit.bin.membrane_subtract-main'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = self._build_cmd()
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Radonfit Membrane Subtraction started with PID:", self.process.pid)
         print(f'Radonfit Membrane Subtraction started using {self.cpu} CPUs and batch size of {self.batch_size}')
         with open(self.PID_FILE, 'w') as f:
@@ -415,6 +453,11 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         self.check_running_process()
         self.launch_pushButton.clicked.connect(self.start_process)
         self.kill_pushButton.clicked.connect(self.kill_process)
+
+        self.show_command_button = QtWidgets.QPushButton("Command...", self.horizontalLayoutWidget_2)
+        self.show_command_button.setToolTip("Show the exact CLI command that will be executed.")
+        self.horizontalLayout_2.insertWidget(1, self.show_command_button)
+        self.show_command_button.clicked.connect(self.show_command)
         
         with open('run.out', 'a') as f:
             f.write(f"Micrograph Membrane Subtraction ready.\n")
@@ -428,6 +471,27 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         if filepath:
             self.particles_selected_starfile_lineEdit.setText(filepath)
             self.particle = filepath
+
+    def _build_cmd(self, *, coerce_numbers: bool) -> list[str]:
+        particles_star = self.particles_selected_starfile_lineEdit.text()
+        cpus = self.cpus_lineEdit.text()
+        batch_size = self.batch_size_lineEdit.text()
+
+        if coerce_numbers:
+            cpus = str(int(cpus))
+            batch_size = str(int(batch_size))
+
+        params = ["--particles_selected_filename", particles_star, "--cpu", cpus, "--batch_size", batch_size]
+        return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.micrograph_mem_subtraction"] + params
+
+    def show_command(self) -> None:
+        from ._command_preview import CommandPreviewDialog
+
+        try:
+            cmd = self._build_cmd(coerce_numbers=True)
+        except Exception:
+            cmd = self._build_cmd(coerce_numbers=False)
+        CommandPreviewDialog(cmd, self).exec_()
     
     def start_process(self):
         ok, details = check_cupy_cuda_available()
@@ -442,13 +506,17 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
             )
             return
 
+        self.particle = self.particles_selected_starfile_lineEdit.text()
         self.cpus = self.cpus_lineEdit.text()
         self.batch_size = self.batch_size_lineEdit.text()
-        params = ['--particles_selected_filename', f'{self.particle}',
-            '--cpu', f'{int(self.cpus)}',
-            '--batch_size', f'{int(self.batch_size)}']
         with open('run.out', 'w') as f:
-            self.process = subprocess.Popen(['python','-u', '-m', 'memxterminator.radonfit.bin.micrograph_mem_subtraction'] + params, stdout=f, stderr=subprocess.STDOUT)
+            cmd = self._build_cmd(coerce_numbers=True)
+            try:
+                f.write(f">>> Command: {shlex.join(cmd)}\n")
+                f.flush()
+            except Exception:
+                pass
+            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
         print(f'Micrograph Membrane Subtraction started using {self.cpus} CPUs and batch size of {self.batch_size}')
         with open(self.PID_FILE, 'w') as f:
