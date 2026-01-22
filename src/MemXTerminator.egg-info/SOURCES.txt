@@ -9,6 +9,7 @@ src/MemXTerminator.egg-info/entry_points.txt
 src/MemXTerminator.egg-info/requires.txt
 src/MemXTerminator.egg-info/top_level.txt
 src/memxterminator/__init__.py
+src/memxterminator/mxt_state.py
 src/memxterminator/GUI/MembraneAnalyzer_Bezierfit.py
 src/memxterminator/GUI/MicrographMembraneSubtraction_Bezierfit.py
 src/memxterminator/GUI/MicrographMembraneSubtraction_Radonfit.py
@@ -29,6 +30,8 @@ src/memxterminator/bezierfit/lib/pickpoints.py
 src/memxterminator/bezierfit/lib/subtraction.py
 src/memxterminator/bezierfit/lib/visualize_fitting_result.py
 src/memxterminator/cli/__init__.py
+src/memxterminator/cli/_command_preview.py
+src/memxterminator/cli/_deps.py
 src/memxterminator/cli/bezierfit_cli.py
 src/memxterminator/cli/main_cli.py
 src/memxterminator/cli/radonfit_cli.py

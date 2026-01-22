@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from multiprocessing import Pool
 from pathlib import Path
 
-import cupy as cp
 import mrcfile
 import multiprocessing
 import starfile
@@ -166,6 +165,8 @@ class MicrographMembraneSubtract:
         return df_temp_dict_X_Y
     
     def fill_nan_with_gaussian_noise(self, image):
+        import cupy as cp
+
         image_copy = image.copy()
         mean_val = cp.nanmean(image_copy)
         std_val = cp.nanstd(image_copy)
@@ -175,6 +176,8 @@ class MicrographMembraneSubtract:
         return image_copy
 
     def _ensure_weights_for_box(self, rawimage_size: int) -> None:
+        import cupy as cp
+
         if self.rawimage_size == int(rawimage_size) and self.weights is not None and self.mask is not None:
             return
         self.rawimage_size = int(rawimage_size)
@@ -445,6 +448,8 @@ class MicrographMembraneSubtract:
         )
 
         try:
+            import cupy as cp
+
             if (not self.force) and self.resume:
                 uptodate, _reason2 = is_uptodate(
                     out_micrograph,

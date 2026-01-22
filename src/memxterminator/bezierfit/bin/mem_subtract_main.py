@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from multiprocessing import Pool
 import multiprocessing
 
-import cupy as cp
 import mrcfile
 import numpy as np
 from cryosparc.dataset import Dataset
@@ -27,8 +26,6 @@ from memxterminator.mxt_state import (
     write_json_atomic,
     write_mrc_atomic,
 )
-
-from ..lib.subtraction import MembraneSubtract
 
 
 _WORKER_RUNNER = None
@@ -49,10 +46,14 @@ def _init_worker(config: dict) -> None:
     a large in-memory object (CryoSPARC dataset arrays) for every task.
     """
     global _WORKER_RUNNER
+    _WORKER_RUNNER = BezierfitParticleMembraneSubtract(**config)
+
     # Best-effort: pin each worker to a GPU in round-robin order if multiple
     # CUDA devices are visible. Users can still control visibility via
     # CUDA_VISIBLE_DEVICES.
     try:
+        import cupy as cp
+
         device_count = int(cp.cuda.runtime.getDeviceCount())
     except Exception:
         device_count = 0
@@ -64,7 +65,6 @@ def _init_worker(config: dict) -> None:
             cp.cuda.Device(device_id).use()
         except Exception:
             pass
-    _WORKER_RUNNER = BezierfitParticleMembraneSubtract(**config)
 
 
 def _process_particle_stack_worker(stack_path: str) -> None:
@@ -98,6 +98,8 @@ def _append_event_log(level: str, event: str, **fields: object) -> None:
 
 
 def fill_nan_with_gaussian_noise(image):
+    import cupy as cp
+
     image_copy = image.copy()
     mean_val = cp.nanmean(image_copy)
     std_val = cp.nanstd(image_copy)
@@ -316,6 +318,9 @@ class BezierfitParticleMembraneSubtract:
             params_hash=self.mxt_params_hash,
         )
         try:
+            import cupy as cp
+            from ..lib.subtraction import MembraneSubtract
+
             # Re-check under lock to avoid duplicate work when two processes race.
             if (not self.force) and self.resume:
                 uptodate, _reason2 = is_uptodate(
@@ -522,7 +527,9 @@ def main() -> None:
     procs = int(args.procs)
     if procs <= 0:
         try:
-            procs = int(cp.cuda.runtime.getDeviceCount())
+            import cupy as _cp
+
+            procs = int(_cp.cuda.runtime.getDeviceCount())
         except Exception:
             procs = 1
 
