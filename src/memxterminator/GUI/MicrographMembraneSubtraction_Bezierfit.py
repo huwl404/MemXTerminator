@@ -82,7 +82,7 @@ class Ui_MicrographMembraneSubtraction_Bezierfit(object):
         self.particle_browse_pushButton_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "Browse..."))
         self.LOG_label.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "LOG"))
         self.cpus_lineEdit_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "15"))
-        self.cpus_label_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "Cpus"))
+        self.cpus_label_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "Procs"))
         self.batch_size_label_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "Batch size"))
         self.batch_size_lineEdit_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "30"))
         self.kill_pushButton_3.setText(_translate("MicrographMembraneSubtraction_Bezierfit", "Kill"))

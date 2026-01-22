@@ -9,6 +9,105 @@ from .bezierfit import points_along_normal, generate_curve_within_boundaries, cu
 import time
 
 
+_DISTRIBUTE_BILINEAR_BATCH_KERNEL = None
+
+
+def _get_distribute_bilinear_batch_kernel() -> cp.RawKernel:
+    """
+    Lazily build the RawKernel to avoid CUDA initialization at import time.
+    """
+    global _DISTRIBUTE_BILINEAR_BATCH_KERNEL
+    if _DISTRIBUTE_BILINEAR_BATCH_KERNEL is None:
+        _DISTRIBUTE_BILINEAR_BATCH_KERNEL = cp.RawKernel(
+            r"""
+extern "C" __global__
+void distribute_bilinearly_batch(
+    const float* xs,
+    const float* ys,
+    const float* vals,
+    const int n,
+    float* out_image,
+    float* out_count,
+    const int width,
+    const int height
+) {
+    int tid = (int)(blockDim.x * blockIdx.x + threadIdx.x);
+    if (tid >= n) return;
+
+    float x = xs[tid];
+    float y = ys[tid];
+    float value = vals[tid];
+
+    int x1 = (int)floorf(x);
+    int y1 = (int)floorf(y);
+    int x2 = x1 + 1;
+    int y2 = y1 + 1;
+
+    if (x1 < 0 || y1 < 0 || x1 >= width || y1 >= height) return;
+
+    // Match the CPU fallback: if the bilinear neighborhood would go out of
+    // bounds, dump everything into the nearest pixel (x1, y1).
+    if (x2 >= width || y2 >= height) {
+        atomicAdd(&out_image[y1 * width + x1], value);
+        atomicAdd(&out_count[y1 * width + x1], 1.0f);
+        return;
+    }
+
+    float w11 = (x2 - x) * (y2 - y);
+    float w21 = (x - x1) * (y2 - y);
+    float w12 = (x2 - x) * (y - y1);
+    float w22 = (x - x1) * (y - y1);
+
+    atomicAdd(&out_image[y1 * width + x1], value * w11);
+    atomicAdd(&out_image[y1 * width + x2], value * w21);
+    atomicAdd(&out_image[y2 * width + x1], value * w12);
+    atomicAdd(&out_image[y2 * width + x2], value * w22);
+
+    atomicAdd(&out_count[y1 * width + x1], w11);
+    atomicAdd(&out_count[y1 * width + x2], w21);
+    atomicAdd(&out_count[y2 * width + x1], w12);
+    atomicAdd(&out_count[y2 * width + x2], w22);
+}
+""",
+            "distribute_bilinearly_batch",
+        )
+    return _DISTRIBUTE_BILINEAR_BATCH_KERNEL
+
+
+def _distribute_bilinearly_batch_gpu(
+    out_image: cp.ndarray,
+    out_count: cp.ndarray,
+    xs: cp.ndarray,
+    ys: cp.ndarray,
+    vals: cp.ndarray,
+) -> None:
+    """
+    Scatter-add bilinear contributions for many points at once (GPU).
+
+    Each point splats `vals[i]` into `out_image` with bilinear weights and
+    accumulates weights into `out_count`. This matches the semantics of the
+    Python `distribute_bilinearly()` used in the CPU fallback.
+    """
+    if xs.size == 0:
+        return
+
+    xs_f = xs.astype(cp.float32, copy=False)
+    ys_f = ys.astype(cp.float32, copy=False)
+    vals_f = vals.astype(cp.float32, copy=False)
+
+    height = int(out_image.shape[0])
+    width = int(out_image.shape[1])
+    n = int(xs_f.size)
+
+    threads = 256
+    blocks = (n + threads - 1) // threads
+    _get_distribute_bilinear_batch_kernel()(
+        (blocks,),
+        (threads,),
+        (xs_f, ys_f, vals_f, n, out_image, out_count, width, height),
+    )
+
+
 def bilinear_interpolation(image, x, y):
     # Define the coordinates of the image
     x_coords = np.arange(image.shape[1])
@@ -155,6 +254,8 @@ class MembraneSubtract:
 
     def average_1d(self, image_gpu, fitted_points, normals, mem_dist):
         average_1d_lst = []
+        fitted_points = cp.asarray(fitted_points, dtype=cp.float32)
+        normals = cp.asarray(normals, dtype=cp.float32)
         for membrane_dist in range(-mem_dist, mem_dist+1):
             normals_points = fitted_points + membrane_dist * normals
             # Ensure the points are within the image boundaries
@@ -163,9 +264,9 @@ class MembraneSubtract:
             normals_points = normals_points[mask]
             # Get interpolated gray values for the normal points
             interpolated_values = bilinear_interpolation_gpu(image_gpu, normals_points[:, 0], normals_points[:, 1])
-            # convert nan to 0
-            interpolated_values = np.nan_to_num(interpolated_values)
-            average_1d_lst.append(np.mean(interpolated_values))
+            # Keep computations on GPU to avoid implicit host transfers via NumPy.
+            interpolated_values = cp.nan_to_num(interpolated_values)
+            average_1d_lst.append(float(cp.mean(interpolated_values).get()))
         return average_1d_lst
     # def average_1d_gpu(self, image_gpu, fitted_points, normals, extra_mem_dist):
     #     average_1d_lst = []
@@ -248,38 +349,65 @@ class MembraneSubtract:
         return new_image.astype(image.dtype)
     
     def average_2d_gpu(self, image_gpu, fitted_points, normals, average_1d_lst, mem_dist):
-        new_image = cp.zeros_like(image_gpu)
-        count_image = cp.zeros_like(image_gpu)
-        fitted_points = cp.asarray(fitted_points)
-        membrane_dists = cp.arange(-mem_dist, mem_dist + 1)
-        # Expand dimensions for broadcasting
-        membrane_dists = membrane_dists[:, cp.newaxis, cp.newaxis]
-        # Calculate all normals_points at once
-        normals = cp.asarray(normals)
-        normals_points = fitted_points + membrane_dists * normals
-        mask = (normals_points[:, 0] >= 0) & (normals_points[:, 0] < image_gpu.shape[1]) & \
-                (normals_points[:, 1] >= 0) & (normals_points[:, 1] < image_gpu.shape[0])
-        mask_expanded = cp.repeat(mask[:, cp.newaxis, :], normals_points.shape[1], axis=1)
-        normals_points = cp.compress(mask_expanded, normals_points, axis=0)
-        # Give the normal points the average gray value with interpolation
-        average_1d_lst = cp.asarray(average_1d_lst)
-        average_1d_lst = cp.compress(mask, average_1d_lst, axis=0)
-        for average_1d in average_1d_lst:
-            for point in normals_points:
-                distribute_bilinearly_gpu(new_image, count_image, point[0], point[1], average_1d)
-        mask = count_image != 0
-        new_image[mask] /= count_image[mask]
-        new_image[cp.isnan(new_image)] = 0
-        return new_image.astype(image_gpu.dtype)
+        """
+        GPU implementation of `average_2d()` without Python loops / host transfers.
+
+        This builds all normal-line points for each membrane distance on GPU and
+        splats them into an image using a single scatter-add kernel.
+        """
+        fitted_points = cp.asarray(fitted_points, dtype=cp.float32)
+        normals = cp.asarray(normals, dtype=cp.float32)
+
+        # Accumulate in float32 for numeric stability and atomicAdd support.
+        out_image = cp.zeros(image_gpu.shape, dtype=cp.float32)
+        out_count = cp.zeros(image_gpu.shape, dtype=cp.float32)
+
+        avg = cp.asarray(average_1d_lst, dtype=cp.float32)
+        dists = cp.arange(-mem_dist, mem_dist + 1, dtype=cp.float32)  # (D,)
+        if avg.size != dists.size:
+            raise ValueError(
+                f"average_1d_lst length ({int(avg.size)}) must equal (2*mem_dist+1) ({int(dists.size)})"
+            )
+
+        # normals_points: (D, P, 2)
+        normals_points = fitted_points[cp.newaxis, :, :] + dists[:, cp.newaxis, cp.newaxis] * normals[cp.newaxis, :, :]
+        xs = normals_points[:, :, 0]
+        ys = normals_points[:, :, 1]
+
+        in_bounds = (xs >= 0) & (xs < float(image_gpu.shape[1])) & (ys >= 0) & (ys < float(image_gpu.shape[0]))
+
+        # Flatten into a single list of points with per-point values.
+        xs_f = xs[in_bounds]
+        ys_f = ys[in_bounds]
+        vals = cp.broadcast_to(avg[:, cp.newaxis], (avg.size, fitted_points.shape[0]))[in_bounds]
+
+        _distribute_bilinearly_batch_gpu(out_image, out_count, xs_f, ys_f, vals)
+
+        mask = out_count > 0
+        out_image[mask] /= out_count[mask]
+        out_image[~mask] = 0
+        return out_image.astype(image_gpu.dtype, copy=False)
     
     def mem_subtract(self):
         control_points = self.control_points_trasf(self.control_points, self.psi, self.origin_x, self.origin_y)
         fitted_curve_points, t_values = generate_curve_within_boundaries(control_points, self.image.shape, self.points_step)
         extra_mem_dist = 10
         mem_mask = self.generate_2d_mask(self.image_gpu, fitted_curve_points, self.mem_dist)
-        raw_image_average_1d_lst = self.average_1d(self.image_gpu, fitted_curve_points, points_along_normal(control_points, t_values).get(), self.mem_dist+extra_mem_dist)
-        raw_image_average_2d = self.average_2d(self.image_gpu, fitted_curve_points, points_along_normal(control_points, t_values).get(), raw_image_average_1d_lst, self.mem_dist+extra_mem_dist)
-        raw_image_average_2d = cp.asarray(raw_image_average_2d) * mem_mask
+        normals = points_along_normal(control_points, t_values)
+        raw_image_average_1d_lst = self.average_1d(
+            self.image_gpu,
+            fitted_curve_points,
+            normals,
+            self.mem_dist + extra_mem_dist,
+        )
+        raw_image_average_2d = self.average_2d_gpu(
+            self.image_gpu,
+            fitted_curve_points,
+            normals,
+            raw_image_average_1d_lst,
+            self.mem_dist + extra_mem_dist,
+        )
+        raw_image_average_2d = raw_image_average_2d * mem_mask
         kernel = gaussian_kernel(5, 1)
         image_conv = convolve2d(self.image_gpu, kernel, mode = 'same')
         raw_image_average_2d_conv = convolve2d(raw_image_average_2d, kernel, mode = 'same')

@@ -7,6 +7,8 @@ import socket
 import time
 import traceback
 from datetime import datetime, timezone
+from multiprocessing import Pool
+import multiprocessing
 
 import cupy as cp
 import mrcfile
@@ -27,6 +29,48 @@ from memxterminator.mxt_state import (
 )
 
 from ..lib.subtraction import MembraneSubtract
+
+
+_WORKER_RUNNER = None
+
+
+def _chunks(lst: list[str], n: int):
+    if n <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {n}")
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def _init_worker(config: dict) -> None:
+    """
+    Per-process initializer for multiprocessing workers.
+
+    We intentionally build the full runner inside each worker to avoid pickling
+    a large in-memory object (CryoSPARC dataset arrays) for every task.
+    """
+    global _WORKER_RUNNER
+    # Best-effort: pin each worker to a GPU in round-robin order if multiple
+    # CUDA devices are visible. Users can still control visibility via
+    # CUDA_VISIBLE_DEVICES.
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        device_count = 0
+    if device_count > 0:
+        try:
+            ident = getattr(multiprocessing.current_process(), "_identity", ())
+            worker_rank = int(ident[0]) if ident else 1  # 1-based in multiprocessing pools
+            device_id = (worker_rank - 1) % device_count
+            cp.cuda.Device(device_id).use()
+        except Exception:
+            pass
+    _WORKER_RUNNER = BezierfitParticleMembraneSubtract(**config)
+
+
+def _process_particle_stack_worker(stack_path: str) -> None:
+    if _WORKER_RUNNER is None:
+        raise RuntimeError("Worker runner not initialized")
+    _WORKER_RUNNER.process_particle_stack(stack_path)
 
 
 def _append_event_log(level: str, event: str, **fields: object) -> None:
@@ -339,7 +383,7 @@ class BezierfitParticleMembraneSubtract:
 
                 del subtractor
                 cp.cuda.Stream.null.synchronize()
-                cp.cuda.MemoryPool().free_all_blocks()
+                cp.get_default_memory_pool().free_all_blocks()
 
             # Atomic output write + `.mxt` sidecar (Spec v1).
             write_mrc_atomic(out_stack, subtracted_particle_stack)
@@ -371,7 +415,7 @@ class BezierfitParticleMembraneSubtract:
             del subtracted_particle_stack
             del particle_stack
             cp.cuda.Stream.null.synchronize()
-            cp.cuda.MemoryPool().free_all_blocks()
+            cp.get_default_memory_pool().free_all_blocks()
         except Exception as exc:
             finished_utc = datetime.now(timezone.utc).isoformat()
             duration = time.time() - started_wall
@@ -419,6 +463,22 @@ def main() -> None:
     parser.add_argument("--points_step", type=float, default=0.005)
     parser.add_argument("--physical_membrane_dist", type=int, default=35)
     parser.add_argument(
+        "--procs",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes to run particle stacks in parallel. "
+            "Use 0 to auto-detect from visible GPUs. "
+            "(default: 1 = serial)"
+        ),
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=20,
+        help="How many particle stacks to process per minibatch when --procs > 1. (default: 20)",
+    )
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -459,8 +519,50 @@ def main() -> None:
 
     print(">>> Preparing Bezierfit Particle Membrane Subtraction dataset...")
     print(f">>> Found {len(runner.particle_stack_paths)} raw particle stacks in total.")
-    for stack_path in runner.particle_stack_paths:
-        runner.process_particle_stack(stack_path)
+    procs = int(args.procs)
+    if procs <= 0:
+        try:
+            procs = int(cp.cuda.runtime.getDeviceCount())
+        except Exception:
+            procs = 1
+
+    if procs <= 1:
+        for stack_path in runner.particle_stack_paths:
+            runner.process_particle_stack(stack_path)
+        return
+
+    # Multiprocessing across particle stacks.
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        # Start method can only be set once per interpreter.
+        pass
+
+    num_cpus = int(procs)
+    batch_size = int(args.batch_size)
+    stack_paths = runner.particle_stack_paths
+
+    worker_config = {
+        "particle_cs": args.particle,
+        "template_cs": args.template,
+        "control_points_json": args.control_points,
+        "points_step": float(args.points_step),
+        "physical_membrane_dist": int(args.physical_membrane_dist),
+        "resume": bool(args.resume),
+        "force": bool(args.force),
+        "adopt_existing_outputs": bool(args.adopt_existing_outputs),
+        "skip_failed": bool(args.skip_failed),
+    }
+
+    minibatches = list(_chunks(stack_paths, batch_size))
+    total_batches = len(minibatches)
+    with Pool(processes=num_cpus, initializer=_init_worker, initargs=(worker_config,)) as pool:
+        for i, minibatch in enumerate(minibatches, start=1):
+            start_time = time.time()
+            pool.map(_process_particle_stack_worker, minibatch, chunksize=1)
+            end_time = time.time()
+            print(f">>> {i} / {total_batches} minibatch finished.")
+            print(f">>> {len(minibatch)} particle stacks took {end_time - start_time:.4f} seconds.")
 
 
 if __name__ == "__main__":

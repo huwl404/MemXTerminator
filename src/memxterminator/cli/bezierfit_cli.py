@@ -205,10 +205,12 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
         control_points = self.controlpoints_lineEdit.text()
         physical_membrane_dist = self.physical_membrane_dist_lineEdit.text()
         points_step = self.points_step_lineEdit.text()
+        procs = self.procs_lineEdit.text()
 
         if coerce_numbers:
             physical_membrane_dist = str(int(physical_membrane_dist))
             points_step = str(float(points_step))
+            procs = str(int(procs))
 
         params = [
             "--template",
@@ -221,6 +223,8 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
             physical_membrane_dist,
             "--points_step",
             points_step,
+            "--procs",
+            procs,
         ]
         return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.mem_subtract_main"] + params
 
@@ -298,7 +302,7 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
         self.process = None
 
         self.particle = None
-        self.cpus = None
+        self.procs = None
         self.batch_size = None
 
         self.check_running_process()
@@ -326,14 +330,14 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
 
     def _build_cmd(self, *, coerce_numbers: bool) -> list[str]:
         particle_star = self.particle_lineEdit_3.text()
-        cpus = self.cpus_lineEdit_3.text()
+        procs = self.cpus_lineEdit_3.text()
         batch_size = self.batch_size_lineEdit_3.text()
 
         if coerce_numbers:
-            cpus = str(int(cpus))
+            procs = str(int(procs))
             batch_size = str(int(batch_size))
 
-        params = ["--particle", particle_star, "--cpu", cpus, "--batch_size", batch_size]
+        params = ["--particle", particle_star, "--procs", procs, "--batch_size", batch_size]
         return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.micrograph_mem_subtract_main"] + params
 
     def show_command(self) -> None:
@@ -367,7 +371,15 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
                 pass
             self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
-        print(f'Micrograph Membrane Subtraction started using {self.cpus} CPUs and batch size of {self.batch_size}')
+        try:
+            self.procs = int(self.cpus_lineEdit_3.text())
+        except Exception:
+            self.procs = self.cpus_lineEdit_3.text()
+        try:
+            self.batch_size = int(self.batch_size_lineEdit_3.text())
+        except Exception:
+            self.batch_size = self.batch_size_lineEdit_3.text()
+        print(f"Micrograph Membrane Subtraction started using {self.procs} procs and batch size of {self.batch_size}")
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
     def kill_process(self):

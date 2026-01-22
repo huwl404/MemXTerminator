@@ -622,7 +622,12 @@ if __name__ == '__main__':
         type=str,
         help='particles_selected.star',
     )
-    parser.add_argument('--cpu', type=int, default=15)
+    parser.add_argument(
+        "--procs",
+        type=int,
+        default=15,
+        help="Number of worker processes to run micrograph stacks in parallel. (default: 15)",
+    )
     parser.add_argument('--batch_size', type=int, default=30)
     parser.add_argument(
         "--resume",
@@ -663,4 +668,4 @@ if __name__ == '__main__':
         skip_failed=args.skip_failed,
         require_particle_mxt=args.require_particle_mxt,
     )
-    mms.micrograph_mem_subtract_multiprocessing(args.cpu, args.batch_size)
+    mms.micrograph_mem_subtract_multiprocessing(args.procs, args.batch_size)
