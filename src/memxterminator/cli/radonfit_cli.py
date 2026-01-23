@@ -10,8 +10,41 @@ import mrcfile
 import subprocess
 import shlex
 import sys
+import signal
 
 from ._deps import check_cupy_cuda_available
+
+
+def _popen_kwargs_for_new_session() -> dict:
+    # On POSIX, start the subprocess in its own session so we can safely
+    # terminate the entire process group (parent + multiprocessing workers).
+    if os.name == "posix":
+        return {"start_new_session": True}
+    return {}
+
+
+def _terminate_pid(pid: int) -> None:
+    """
+    Best-effort terminate a subprocess (and its worker children when possible).
+
+    - If the process is the leader of its own process group (pgid == pid),
+      terminate the whole group.
+    - Otherwise, fall back to terminating only the PID.
+    """
+    if pid <= 0:
+        return
+    try:
+        if os.name == "posix":
+            try:
+                pgid = os.getpgid(pid)
+                if pgid == pid:
+                    os.killpg(pgid, signal.SIGTERM)
+                    return
+            except Exception:
+                pass
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
 
 
 class RadonApp(QtWidgets.QDialog, Ui_Form):
@@ -133,7 +166,8 @@ class RadonApp(QtWidgets.QDialog, Ui_Form):
         QMessageBox.information(self, "Info", "Results saved successfully!")
 
 class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
-    PID_FILE = 'process.pid'
+    PID_FILE = "radonfit_membrane_analysis.pid"
+    LOG_FILE = "radonfit_membrane_analysis.run.out"
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setupUi(self)
@@ -166,12 +200,13 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         self.extra_mem_dist = None
         self.mem_edge_sigma = None
 
+        self._process_pid = None
         self.check_running_process()
         self.Launch_button.clicked.connect(self.start_process)
         self.Kill_button.clicked.connect(self.kill_process)
         
-        with open('run.out', 'a') as f:
-            f.write(f"Radonfit Membrane Analysis ready.\n")
+        with open(self.LOG_FILE, "a") as f:
+            f.write("Radonfit Membrane Analysis ready.\n")
         self.last_read_position = 0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_log)
@@ -253,7 +288,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                   '--mem_edge_sigma', f'{self.mem_edge_sigma}']
         # self.process = subprocess.Popen(['python', 'membrane_analysis-main.py'] + params)
 
-        with open('run.out', 'w') as f:
+        with open(self.LOG_FILE, 'w') as f:
             # self.process = subprocess.Popen(['python','-u', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'membrane_analysis-main.py')] + params, stdout=f, stderr=subprocess.STDOUT)
             cmd = [sys.executable, '-u', '-m', 'memxterminator.radonfit.bin.membrane_analysis-main'] + params
             try:
@@ -261,35 +296,77 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                 f.flush()
             except Exception:
                 pass
-            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                **_popen_kwargs_for_new_session(),
+            )
         print("Radonfit Membrane Analysis started with PID:", self.process.pid)
+        self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
     def kill_process(self):
-        if self.process:
-            self.process.terminate()
-            print(f"Process PID {self.process.pid} terminated")
-            self.process = None
-            if os.path.exists(self.PID_FILE):
-                os.remove(self.PID_FILE)
-            self.timer.stop()
+        pid = None
+        if isinstance(self.process, subprocess.Popen):
+            pid = int(self.process.pid)
+        elif self._process_pid is not None:
+            pid = int(self._process_pid)
+        else:
+            return
+
+        _terminate_pid(pid)
+        print(f"Process PID {pid} terminated")
+        self.process = None
+        self._process_pid = None
+        if os.path.exists(self.PID_FILE):
+            os.remove(self.PID_FILE)
+        self.timer.stop()
     def update_log(self):
         try:
-            with open('run.out', 'r') as f:
+            with open(self.LOG_FILE, 'r') as f:
                 f.seek(self.last_read_position)
                 new_content = f.read()
                 self.last_read_position = f.tell()
             if new_content:
                 self.textBrowser_log.append(new_content)
         except FileNotFoundError:
-            self.textBrowser_log.append("Error: 'run.out' file not found.")
+            self.textBrowser_log.append(f"Error: '{self.LOG_FILE}' file not found.")
+        self._refresh_process_state()
+
+    def _refresh_process_state(self) -> None:
+        # If we launched the process in this GUI session, we have a Popen handle.
+        if isinstance(self.process, subprocess.Popen):
+            ret = self.process.poll()
+            if ret is None:
+                return
+            pid = int(self.process.pid)
+            self.process = None
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.textBrowser_log.append(f">>> DONE (PID={pid}, exit_code={ret})")
+            return
+
+        # If we only have a PID from a previous GUI session, check if it's still alive.
+        if self._process_pid is None:
+            return
+        pid = int(self._process_pid)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.textBrowser_log.append(f">>> DONE (PID={pid})")
     def check_running_process(self):
         if os.path.exists(self.PID_FILE):
             with open(self.PID_FILE, 'r') as f:
                 pid = int(f.read().strip())
             try:
                 os.kill(pid, 0)  # Check if process is running
-                self.process = pid
+                self.process = None
+                self._process_pid = pid
                 print(f"Process with PID {pid} is still running!")
                 # Here, you can also update the GUI to show that the process is running
             except OSError:
@@ -297,12 +374,22 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                 os.remove(self.PID_FILE)
 
 class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
-    PID_FILE = 'process.pid'
+    PID_FILE = "radonfit_particle_pms.pid"
+    LOG_FILE = "radonfit_particle_pms.run.out"
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setupUi(self)
         self.particles_selected_starfile_button.clicked.connect(self.browse_particles_starfile)
         self.membrane_analysis_results_button.clicked.connect(self.browse_mem_analysis_starfile)
+
+        worker_tip = (
+            "Procs = worker processes for GPU computation (this is NOT CPU cores).\n"
+            "0 = auto-detect from visible GPUs.\n"
+            "Recommendation: for 1 GPU, use 1. Do not exceed the number of GPUs."
+        )
+        self.CPU_label.setText("Procs")
+        self.CPU_label.setToolTip(worker_tip)
+        self.CPU_lineEdit.setToolTip(worker_tip)
 
 
         self.mem_analysis_starfile_name = None
@@ -315,6 +402,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.cpu = self.CPU_lineEdit.text()
         self.batch_size = self.Batch_size_lineEdit.text()
         self.process = None
+        self._process_pid = None
 
         self.check_running_process()
         self.launch_button.clicked.connect(self.start_process)
@@ -325,8 +413,8 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.horizontalLayout.insertWidget(1, self.show_command_button)
         self.show_command_button.clicked.connect(self.show_command)
         
-        with open('run.out', 'a') as f:
-            f.write(f"Radonfit Membrane Subtraction ready.\n")
+        with open(self.LOG_FILE, "a") as f:
+            f.write("Radonfit Membrane Subtraction ready.\n")
         self.last_read_position = 0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_log)
@@ -361,7 +449,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
             self.Scaling_factor_end_lineEdit.text(),
             "--scaling_factor_step",
             self.Step_lineEdit.text(),
-            "--cpu",
+            "--procs",
             self.CPU_lineEdit.text(),
             "--batch_size",
             self.Batch_size_lineEdit.text(),
@@ -395,44 +483,92 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.scaling_factor_step = self.Step_lineEdit.text()
         self.cpu = self.CPU_lineEdit.text()
         self.batch_size = self.Batch_size_lineEdit.text()
-        with open('run.out', 'w') as f:
+        with open(self.LOG_FILE, 'w') as f:
             cmd = self._build_cmd()
+            particles_star = self.particles_selected_starfile_lineEdit.text()
+            base, ext = os.path.splitext(particles_star)
+            if ext.lower() != ".star":
+                base = particles_star
+            out_star_all = f"{base}_subtracted.star"
+            out_star_completed = f"{base}_subtracted_completed.star"
+            f.write(f">>> STAR outputs (for cryoSPARC import): {out_star_all}\n")
+            f.write(f">>> STAR outputs (completed-only): {out_star_completed}\n")
             try:
                 f.write(f">>> Command: {shlex.join(cmd)}\n")
                 f.flush()
             except Exception:
                 pass
-            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                **_popen_kwargs_for_new_session(),
+            )
         print("Radonfit Membrane Subtraction started with PID:", self.process.pid)
-        print(f'Radonfit Membrane Subtraction started using {self.cpu} CPUs and batch size of {self.batch_size}')
+        print(f"Radonfit Membrane Subtraction started using {self.cpu} procs and batch size of {self.batch_size}")
+        self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
     def kill_process(self):
-        if self.process:
-            self.process.terminate()
-            print(f"Process PID {self.process.pid} terminated")
-            self.process = None
-            if os.path.exists(self.PID_FILE):
-                os.remove(self.PID_FILE)
-            self.timer.stop()
+        pid = None
+        if isinstance(self.process, subprocess.Popen):
+            pid = int(self.process.pid)
+        elif self._process_pid is not None:
+            pid = int(self._process_pid)
+        else:
+            return
+
+        _terminate_pid(pid)
+        print(f"Process PID {pid} terminated")
+        self.process = None
+        self._process_pid = None
+        if os.path.exists(self.PID_FILE):
+            os.remove(self.PID_FILE)
+        self.timer.stop()
     def update_log(self):
         # 读取日志文件内容
         try:
-            with open('run.out', 'r') as f:
+            with open(self.LOG_FILE, 'r') as f:
                 f.seek(self.last_read_position)  # 跳转到上次读取的位置
                 new_content = f.read()  # 读取新内容
                 self.last_read_position = f.tell()  # 更新读取的位置
             if new_content:
                 self.textBrowser_log.append(new_content)
         except FileNotFoundError:
-            self.textBrowser_log.append("Error: 'run.out' file not found.")
+            self.textBrowser_log.append(f"Error: '{self.LOG_FILE}' file not found.")
+        self._refresh_process_state()
+
+    def _refresh_process_state(self) -> None:
+        if isinstance(self.process, subprocess.Popen):
+            ret = self.process.poll()
+            if ret is None:
+                return
+            pid = int(self.process.pid)
+            self.process = None
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.textBrowser_log.append(f">>> DONE (PID={pid}, exit_code={ret})")
+            return
+
+        if self._process_pid is None:
+            return
+        pid = int(self._process_pid)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.textBrowser_log.append(f">>> DONE (PID={pid})")
     def check_running_process(self):
         if os.path.exists(self.PID_FILE):
             with open(self.PID_FILE, 'r') as f:
                 pid = int(f.read().strip())
             try:
                 os.kill(pid, 0)  # Check if process is running
-                self.process = pid
+                self.process = None
+                self._process_pid = pid
                 print(f"Process with PID {pid} is still running!")
                 # Here, you can also update the GUI to show that the process is running
             except OSError:
@@ -441,12 +577,14 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
 
 
 class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMembraneSubtraction_Radonfit):
-    PID_FILE = 'process.pid'
+    PID_FILE = "radonfit_micrograph_mms.pid"
+    LOG_FILE = "radonfit_micrograph_mms.run.out"
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setupUi(self)
         self.particles_selected_starfile_browse_pushButton.clicked.connect(self.particle_browse)
         self.process = None
+        self._process_pid = None
         self.cpus = None
         self.batch_size = None
         self.particle = None
@@ -459,8 +597,8 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         self.horizontalLayout_2.insertWidget(1, self.show_command_button)
         self.show_command_button.clicked.connect(self.show_command)
         
-        with open('run.out', 'a') as f:
-            f.write(f"Micrograph Membrane Subtraction ready.\n")
+        with open(self.LOG_FILE, "a") as f:
+            f.write("Micrograph Membrane Subtraction ready.\n")
         self.last_read_position = 0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_log)
@@ -481,7 +619,7 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
             cpus = str(int(cpus))
             batch_size = str(int(batch_size))
 
-        params = ["--particles_selected_filename", particles_star, "--cpu", cpus, "--batch_size", batch_size]
+        params = ["--particles_selected_filename", particles_star, "--procs", cpus, "--batch_size", batch_size]
         return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.micrograph_mem_subtraction"] + params
 
     def show_command(self) -> None:
@@ -509,43 +647,83 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         self.particle = self.particles_selected_starfile_lineEdit.text()
         self.cpus = self.cpus_lineEdit.text()
         self.batch_size = self.batch_size_lineEdit.text()
-        with open('run.out', 'w') as f:
+        with open(self.LOG_FILE, 'w') as f:
             cmd = self._build_cmd(coerce_numbers=True)
             try:
                 f.write(f">>> Command: {shlex.join(cmd)}\n")
                 f.flush()
             except Exception:
                 pass
-            self.process = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                **_popen_kwargs_for_new_session(),
+            )
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
-        print(f'Micrograph Membrane Subtraction started using {self.cpus} CPUs and batch size of {self.batch_size}')
+        print(f"Micrograph Membrane Subtraction started using {self.cpus} procs and batch size of {self.batch_size}")
+        self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
     def kill_process(self):
-        if self.process:
-            self.process.terminate()
-            print(f"Process PID {self.process.pid} terminated")
-            self.process = None
-            if os.path.exists(self.PID_FILE):
-                os.remove(self.PID_FILE)
-            self.timer.stop()
+        pid = None
+        if isinstance(self.process, subprocess.Popen):
+            pid = int(self.process.pid)
+        elif self._process_pid is not None:
+            pid = int(self._process_pid)
+        else:
+            return
+
+        _terminate_pid(pid)
+        print(f"Process PID {pid} terminated")
+        self.process = None
+        self._process_pid = None
+        if os.path.exists(self.PID_FILE):
+            os.remove(self.PID_FILE)
+        self.timer.stop()
     def update_log(self):
         try:
-            with open('run.out', 'r') as f:
+            with open(self.LOG_FILE, 'r') as f:
                 f.seek(self.last_read_position)
                 new_content = f.read()
                 self.last_read_position = f.tell()
             if new_content:
                 self.LOG_textBrowser.append(new_content)
         except FileNotFoundError:
-            self.LOG_textBrowser.append("Error: 'run.out' file not found.")
+            self.LOG_textBrowser.append(f"Error: '{self.LOG_FILE}' file not found.")
+        self._refresh_process_state()
+
+    def _refresh_process_state(self) -> None:
+        if isinstance(self.process, subprocess.Popen):
+            ret = self.process.poll()
+            if ret is None:
+                return
+            pid = int(self.process.pid)
+            self.process = None
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.LOG_textBrowser.append(f">>> DONE (PID={pid}, exit_code={ret})")
+            return
+
+        if self._process_pid is None:
+            return
+        pid = int(self._process_pid)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            self._process_pid = None
+            if os.path.exists(self.PID_FILE):
+                os.remove(self.PID_FILE)
+            self.LOG_textBrowser.append(f">>> DONE (PID={pid})")
     def check_running_process(self):
         if os.path.exists(self.PID_FILE):
             with open(self.PID_FILE, 'r') as f:
                 pid = int(f.read().strip())
             try:
                 os.kill(pid, 0)  # Check if process is running
-                self.process = pid
+                self.process = None
+                self._process_pid = pid
                 print(f"Process with PID {pid} is still running!")
             except OSError:
                 print(f"Process with PID {pid} is not running.")

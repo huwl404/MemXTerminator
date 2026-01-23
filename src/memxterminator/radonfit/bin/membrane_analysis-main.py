@@ -134,3 +134,6 @@ membrane_masks = np.array(membrane_masks)
 averaged_membranes = np.array(averaged_membranes)
 savemrc(membrane_masks, f'''{average_2d_lst[0][0].replace('.mrc', '_masks.mrc')}''')
 savemrc(averaged_membranes, f'''{average_2d_lst[0][0].replace('.mrc', '_averaged.mrc')}''')
+
+print(">>> Membrane analysis COMPLETED!")
+print(f">>> Output STAR: {output_filename}")

@@ -81,7 +81,7 @@ class Ui_MicrographMembraneSubtraction_Radonfit(object):
         self.particles_selected_starfile_label.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Particles selected starfile"))
         self.particles_selected_starfile_browse_pushButton.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Browse..."))
         self.cpus_lineEdit.setText(_translate("MicrographMembraneSubtraction_Radonfit", "15"))
-        self.cpus_label.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Cpus"))
+        self.cpus_label.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Procs"))
         self.batch_size_label.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Batch size"))
         self.batch_size_lineEdit.setText(_translate("MicrographMembraneSubtraction_Radonfit", "30"))
         self.kill_pushButton.setText(_translate("MicrographMembraneSubtraction_Radonfit", "Kill"))

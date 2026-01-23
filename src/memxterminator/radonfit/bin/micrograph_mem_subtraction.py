@@ -613,7 +613,14 @@ if __name__ == '__main__':
         type=str,
         help='particles_selected.star',
     )
-    parser.add_argument('--cpu', type=int, default=15)
+    parser.add_argument(
+        "--procs",
+        "--cpu",
+        dest="cpu",
+        type=int,
+        default=15,
+        help="Number of worker processes to run micrograph stacks in parallel. (default: 15)",
+    )
     parser.add_argument('--batch_size', type=int, default=30)
     parser.add_argument(
         "--resume",

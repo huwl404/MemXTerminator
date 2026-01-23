@@ -9,13 +9,15 @@ from collections.abc import Mapping
 from typing import Optional, Tuple
 
 def readmrc(filename, section=0, mode='cpu'):
-    image = mrcfile.open(filename)
-    if len(image.data.shape) == 2:
-        gray_image = image.data.copy()
-    elif len(image.data.shape) == 3: 
-        gray_image = image.data[section].copy()
-    else:
-        raise ValueError("Unsupported image dimensions")
+    with mrcfile.open(filename, permissive=True) as mrc:
+        data = mrc.data
+        if len(data.shape) == 2:
+            gray_image = data.copy()
+        elif len(data.shape) == 3:
+            gray_image = data[int(section)].copy()
+        else:
+            raise ValueError("Unsupported image dimensions")
+
     if mode == 'cpu':
         return gray_image
     elif mode == 'gpu':

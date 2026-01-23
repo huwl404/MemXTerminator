@@ -147,6 +147,6 @@ class Ui_MembraneSubtraction(object):
         self.Step_lineEdit.setText(_translate("MembraneSubtraction", "0.01"))
         self.Batch_size_lineEdit.setText(_translate("MembraneSubtraction", "20"))
         self.Batch_size_label.setText(_translate("MembraneSubtraction", "Batch_size"))
-        self.CPU_lineEdit.setText(_translate("MembraneSubtraction", "10"))
-        self.CPU_label.setText(_translate("MembraneSubtraction", "CPU"))
+        self.CPU_lineEdit.setText(_translate("MembraneSubtraction", "0"))
+        self.CPU_label.setText(_translate("MembraneSubtraction", "Procs"))
         self.label_3.setText(_translate("MembraneSubtraction", "LOG"))

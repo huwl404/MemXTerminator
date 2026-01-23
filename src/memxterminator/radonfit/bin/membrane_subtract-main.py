@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -28,6 +30,65 @@ from memxterminator.mxt_state import (
 from ..lib._utils import *
 from ..lib.mem_subtract import *
 from setproctitle import setproctitle
+
+_WORKER_RUNNER = None
+
+
+def _remove_duplicates_preserve_order(seq: list[str]) -> list[str]:
+    return list(dict.fromkeys(seq))
+
+
+def _chunks(lst: list[str], n: int):
+    if n <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {n}")
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def _init_worker(config: dict) -> None:
+    """
+    Per-process initializer for multiprocessing workers.
+
+    We intentionally build the full runner inside each worker to avoid pickling
+    a large in-memory object (CuPy arrays, pandas DataFrames) for every task.
+    """
+    global _WORKER_RUNNER
+
+    # Best-effort: pin each worker to a GPU in round-robin order if multiple
+    # CUDA devices are visible. Users can still control visibility via
+    # CUDA_VISIBLE_DEVICES.
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        device_count = 0
+    if device_count > 0:
+        try:
+            ident = getattr(multiprocessing.current_process(), "_identity", ())
+            worker_rank = int(ident[0]) if ident else 1  # 1-based in multiprocessing pools
+            device_id = (worker_rank - 1) % device_count
+            cp.cuda.Device(device_id).use()
+        except Exception:
+            pass
+
+    _WORKER_RUNNER = MembraneSubtract(**config)
+
+
+def _process_rawimage_stack_worker(stack_path: str) -> str:
+    if _WORKER_RUNNER is None:
+        raise RuntimeError("Worker runner not initialized")
+    return _WORKER_RUNNER.process_rawimage_stack(stack_path)
+
+
+def _get_raw_particle_stack_paths(particles_star: str) -> list[str]:
+    """
+    Return unique stack paths (preserving order) from a RELION particles STAR.
+    """
+    star_tables_particles = read_star_any(particles_star)
+    df_star = get_relion_particles_table(star_tables_particles)
+    parsed = [parse_relion_image_name_1based(x) for x in df_star["rlnImageName"].tolist()]
+    raw_paths = [p for p, _ in parsed]
+    return _remove_duplicates_preserve_order(raw_paths)
+
 
 def _derive_star_output_paths(input_star: str) -> tuple[str, str]:
     """
@@ -243,11 +304,11 @@ class MembraneSubtract:
 
         self.rawimage_stacks_name_lst = self.get_rawimage_stacks_name_lst()
         self.average2ds_dict, self.average2d_name, self.averaged_mem_name, self.mem_mask_name = self.get_2daverage_averaged_mask_stack_name()
-        with mrcfile.open(self.average2d_name) as mrc:
+        with mrcfile.open(self.average2d_name, permissive=True) as mrc:
             self.average2ds = cp.asarray(mrc.data)
-        with mrcfile.open(self.averaged_mem_name) as mrc:
+        with mrcfile.open(self.averaged_mem_name, permissive=True) as mrc:
             self.averaged_membranes = cp.asarray(mrc.data)
-        with mrcfile.open(self.mem_mask_name) as mrc:
+        with mrcfile.open(self.mem_mask_name, permissive=True) as mrc:
             self.membrane_masks = cp.asarray(mrc.data)
         # self.average2ds = cp.asarray(mrcfile.open(self.average2d_name).data)
         # self.averaged_membranes = cp.asarray(mrcfile.open(self.averaged_mem_name).data)
@@ -370,7 +431,7 @@ class MembraneSubtract:
         if error is not None:
             obj["error"] = error
         return obj
-    def process_rawimage_stack(self, rawimage_stacks_name):
+    def process_rawimage_stack(self, rawimage_stacks_name: str) -> str:
         setproctitle('MemXTerminator-radPMS')
 
         raw_stack = rawimage_stacks_name
@@ -397,7 +458,7 @@ class MembraneSubtract:
             if uptodate:
                 print(f">>> SKIP_UPTODATE {raw_stack} -> {out_stack}")
                 self._append_event_log("INFO", "SKIP_UPTODATE", raw_stack=raw_stack, out_stack=out_stack)
-                return
+                return "SKIP_UPTODATE"
 
             if self.skip_failed and os.path.exists(mxt_path):
                 try:
@@ -409,7 +470,7 @@ class MembraneSubtract:
                     ):
                         print(f">>> SKIP_FAILED {raw_stack} -> {out_stack}")
                         self._append_event_log("WARN", "SKIP_FAILED", raw_stack=raw_stack, out_stack=out_stack)
-                        return
+                        return "SKIP_FAILED"
                 except Exception:
                     pass
 
@@ -441,13 +502,13 @@ class MembraneSubtract:
                     out_stack=out_stack,
                     run_id=adopt_run_id,
                 )
-                return
+                return "ADOPT_EXISTING_OUTPUT"
 
         run_id = f"{datetime.now(timezone.utc).isoformat()}-{os.getpid()}"
         if not try_acquire_lock(lock_path, run_id=run_id):
             print(f">>> LOCKED_SKIP {raw_stack} -> {out_stack}")
             self._append_event_log("INFO", "LOCKED_SKIP", raw_stack=raw_stack, out_stack=out_stack)
-            return
+            return "LOCKED_SKIP"
 
         started_wall = time.time()
         started_utc = datetime.now(timezone.utc).isoformat()
@@ -475,7 +536,7 @@ class MembraneSubtract:
                     self._append_event_log(
                         "INFO", "SKIP_UPTODATE", raw_stack=raw_stack, out_stack=out_stack, run_id=run_id
                     )
-                    return
+                    return "SKIP_UPTODATE"
 
             with mrcfile.open(raw_stack) as mrc:
                 rawimages_stacks = cp.asarray(mrc.data)
@@ -513,8 +574,6 @@ class MembraneSubtract:
                 del average2d
                 del averaged_membrane
                 del membrane_mask
-                cp.cuda.Stream.null.synchronize()
-                cp.cuda.MemoryPool().free_all_blocks()
 
             # Atomic output write + `.mxt` sidecar (Spec v1).
             write_mrc_atomic(out_stack, rawimages_stacks_subtracted)
@@ -546,7 +605,8 @@ class MembraneSubtract:
             del rawimages_stacks
             del rawimages_stacks_subtracted
             cp.cuda.Stream.null.synchronize()
-            cp.cuda.MemoryPool().free_all_blocks()
+            cp.get_default_memory_pool().free_all_blocks()
+            return "SUCCESS"
         except Exception as exc:
             finished_utc = datetime.now(timezone.utc).isoformat()
             duration = time.time() - started_wall
@@ -586,39 +646,69 @@ class MembraneSubtract:
             release_lock(lock_path)
 
     def membrane_subtract_multiprocess(self, num_cpus, batch_size):
-        multiprocessing.set_start_method('spawn')
-
-        def chunks(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-        
         print('>>> Preparing Radonfit Particle Membrane Subtraction dataset...')
         print(f'>>> Found {len(self.rawimage_stacks_name_lst)} raw particle stacks in total.')
+        num_cpus_int = int(num_cpus)
+        batch_size_int = int(batch_size)
 
-        minibatches = list(chunks(self.rawimage_stacks_name_lst, batch_size))
-        i = 1
-        total_len = len(minibatches)
-        for minibatch in minibatches:
-            with Pool(num_cpus) as p:
+        if num_cpus_int <= 1:
+            for stack_path in self.rawimage_stacks_name_lst:
+                self.process_rawimage_stack(stack_path)
+            return
+
+        try:
+            multiprocessing.set_start_method("spawn")
+        except RuntimeError:
+            # Start method can only be set once per interpreter.
+            pass
+
+        worker_config = {
+            "particles_selected_filename": self.particles_selected_filename,
+            "membrane_analysis_filename": self.membrane_analysis_filename,
+            "bias": float(self.bias),
+            "extra_mem_dist": float(self.extra_mem_dist),
+            "scaling_factor_start": float(self.scaling_factor_start),
+            "scaling_factor_end": float(self.scaling_factor_end),
+            "scaling_factor_step": float(self.scaling_factor_step),
+            "resume": bool(self.resume),
+            "force": bool(self.force),
+            "adopt_existing_outputs": bool(self.adopt_existing_outputs),
+            "skip_failed": bool(self.skip_failed),
+            "strict_output_check": bool(self.strict_output_check),
+        }
+
+        minibatches = list(_chunks(self.rawimage_stacks_name_lst, batch_size_int))
+        total_batches = len(minibatches)
+        with Pool(processes=num_cpus_int, initializer=_init_worker, initargs=(worker_config,)) as pool:
+            for i, minibatch in enumerate(minibatches, start=1):
                 start_time = time.time()
-                p.map(self.process_rawimage_stack, minibatch)
+                pool.map(_process_rawimage_stack_worker, minibatch, chunksize=1)
                 end_time = time.time()
-                print(f'>>> {i} / {total_len} minibatch finished.')
+                print(f">>> {i} / {total_batches} minibatch finished.")
                 print(f">>> {len(minibatch)} particle stacks took {end_time - start_time:.4f} seconds.")
-                i += 1
 
-if __name__ == '__main__':
 
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--particles_selected_filename', '-ps', type=str, default='J419/particles_selected.star')
-    parser.add_argument('--membrane_analysis_filename', '-ms', type=str, default='J419/mem_analysis.star')
-    parser.add_argument('--bias', '-b', type=float, default=0.05)
-    parser.add_argument('--extra_mem_dist', type=float, default=20)
-    parser.add_argument('--scaling_factor_start', type=float, default=0.1)
-    parser.add_argument('--scaling_factor_end', type=float, default=1)
-    parser.add_argument('--scaling_factor_step', type=float, default=0.01)
-    parser.add_argument('--cpu', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument("--particles_selected_filename", "-ps", type=str, default="J419/particles_selected.star")
+    parser.add_argument("--membrane_analysis_filename", "-ms", type=str, default="J419/mem_analysis.star")
+    parser.add_argument("--bias", "-b", type=float, default=0.05)
+    parser.add_argument("--extra_mem_dist", type=float, default=20)
+    parser.add_argument("--scaling_factor_start", type=float, default=0.1)
+    parser.add_argument("--scaling_factor_end", type=float, default=1)
+    parser.add_argument("--scaling_factor_step", type=float, default=0.01)
+    parser.add_argument(
+        "--procs",
+        "--cpu",
+        dest="cpu",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes. Use 1 for serial (recommended for single-GPU). "
+            "Use 0 to auto-detect from visible GPUs."
+        ),
+    )
+    parser.add_argument("--batch_size", type=int, default=20)
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -671,38 +761,123 @@ if __name__ == '__main__':
     args = parser.parse_args()
     particles_selected_filename = args.particles_selected_filename
     membrane_analysis_filename = args.membrane_analysis_filename
-    bias = args.bias
-    extra_mem_dist = args.extra_mem_dist
-    scaling_factor_start = args.scaling_factor_start
-    scaling_factor_end = args.scaling_factor_end
-    scaling_factor_step = args.scaling_factor_step
-    cpus_num = args.cpu
-    batch_size = args.batch_size
+    bias = float(args.bias)
+    extra_mem_dist = float(args.extra_mem_dist)
+    scaling_factor_start = float(args.scaling_factor_start)
+    scaling_factor_end = float(args.scaling_factor_end)
+    scaling_factor_step = float(args.scaling_factor_step)
+    batch_size = int(args.batch_size)
 
-    membrane_subtract = MembraneSubtract(
-        particles_selected_filename,
-        membrane_analysis_filename,
-        bias,
-        extra_mem_dist,
-        scaling_factor_start,
-        scaling_factor_end,
-        scaling_factor_step,
-        resume=args.resume,
-        force=args.force,
-        adopt_existing_outputs=args.adopt_existing_outputs,
-        skip_failed=args.skip_failed,
+    # Match MembraneSubtract.mxt_params_hash (Spec v1 §8.3).
+    expected_params_hash = compute_params_hash(
+        {
+            "bias": float(bias),
+            "extra_mem_dist": float(extra_mem_dist),
+            "scaling_factor_start": float(scaling_factor_start),
+            "scaling_factor_end": float(scaling_factor_end),
+            "scaling_factor_step": float(scaling_factor_step),
+        }
     )
-    membrane_subtract.membrane_subtract_multiprocess(num_cpus=cpus_num, batch_size=batch_size)
 
-    if args.write_star or args.write_star_completed:
-        out_all_default, out_completed_default = _derive_star_output_paths(particles_selected_filename)
-        out_star_all = args.star_out_all or out_all_default
-        out_star_completed = args.star_out_completed or out_completed_default
-        write_radonfit_pms_star_outputs(
-            input_star=particles_selected_filename,
-            expected_params_hash=membrane_subtract.mxt_params_hash,
-            out_star_all=out_star_all,
-            out_star_completed=out_star_completed,
-            write_all=args.write_star,
-            write_completed=args.write_star_completed,
+    # Decide worker count (allow auto-detect with --procs 0).
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        device_count = 0
+
+    cpus_num = int(args.cpu)
+    if cpus_num <= 0:
+        cpus_num = device_count if device_count > 0 else 1
+    if device_count > 0 and cpus_num > device_count:
+        print(
+            f">>> WARNING: requested --procs={cpus_num}, but only {device_count} CUDA device(s) are visible. "
+            "Oversubscribing a single GPU with many processes is often slower."
         )
+
+    print(">>> Preparing Radonfit Particle Membrane Subtraction dataset...")
+    stack_paths = _get_raw_particle_stack_paths(particles_selected_filename)
+    print(f">>> Found {len(stack_paths)} raw particle stacks in total.")
+
+    processing_failed = False
+    outcomes: list[str] = []
+    try:
+        if cpus_num <= 1:
+            runner = MembraneSubtract(
+                particles_selected_filename,
+                membrane_analysis_filename,
+                bias,
+                extra_mem_dist,
+                scaling_factor_start,
+                scaling_factor_end,
+                scaling_factor_step,
+                resume=args.resume,
+                force=args.force,
+                adopt_existing_outputs=args.adopt_existing_outputs,
+                skip_failed=args.skip_failed,
+            )
+            for stack_path in stack_paths:
+                outcomes.append(runner.process_rawimage_stack(stack_path))
+        else:
+            # Multiprocessing across particle stacks.
+            try:
+                multiprocessing.set_start_method("spawn")
+            except RuntimeError:
+                # Start method can only be set once per interpreter.
+                pass
+
+            worker_config = {
+                "particles_selected_filename": particles_selected_filename,
+                "membrane_analysis_filename": membrane_analysis_filename,
+                "bias": float(bias),
+                "extra_mem_dist": float(extra_mem_dist),
+                "scaling_factor_start": float(scaling_factor_start),
+                "scaling_factor_end": float(scaling_factor_end),
+                "scaling_factor_step": float(scaling_factor_step),
+                "resume": bool(args.resume),
+                "force": bool(args.force),
+                "adopt_existing_outputs": bool(args.adopt_existing_outputs),
+                "skip_failed": bool(args.skip_failed),
+                "strict_output_check": True,
+            }
+
+            minibatches = list(_chunks(stack_paths, batch_size))
+            total_batches = len(minibatches)
+            with Pool(processes=int(cpus_num), initializer=_init_worker, initargs=(worker_config,)) as pool:
+                for i, minibatch in enumerate(minibatches, start=1):
+                    start_time = time.time()
+                    outcomes.extend(pool.map(_process_rawimage_stack_worker, minibatch, chunksize=1))
+                    end_time = time.time()
+                    print(f">>> {i} / {total_batches} minibatch finished.")
+                    print(f">>> {len(minibatch)} particle stacks took {end_time - start_time:.4f} seconds.")
+
+        succeeded = sum(1 for x in outcomes if x in {"SUCCESS", "SKIP_UPTODATE", "ADOPT_EXISTING_OUTPUT"})
+        skipped = sum(1 for x in outcomes if x in {"LOCKED_SKIP", "SKIP_FAILED"})
+        failed = len(stack_paths) - succeeded - skipped
+        print(f">>> SUMMARY: Succeeded={succeeded} Failed={failed} Skipped={skipped} Total={len(stack_paths)}")
+    except Exception:
+        processing_failed = True
+        raise
+    finally:
+        if args.write_star or args.write_star_completed:
+            out_all_default, out_completed_default = _derive_star_output_paths(particles_selected_filename)
+            out_star_all = args.star_out_all or out_all_default
+            out_star_completed = args.star_out_completed or out_completed_default
+            print(f">>> STAR outputs (for cryoSPARC import): {out_star_all}")
+            print(f">>> STAR outputs (completed-only): {out_star_completed}")
+            try:
+                write_radonfit_pms_star_outputs(
+                    input_star=particles_selected_filename,
+                    expected_params_hash=expected_params_hash,
+                    out_star_all=out_star_all,
+                    out_star_completed=out_star_completed,
+                    write_all=args.write_star,
+                    write_completed=args.write_star_completed,
+                )
+            except Exception as exc:
+                print(f">>> WARNING: failed to write STAR outputs: {type(exc).__name__}: {exc}")
+                if not processing_failed:
+                    raise
+
+
+if __name__ == "__main__":
+    main()
