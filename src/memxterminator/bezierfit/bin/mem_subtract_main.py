@@ -351,7 +351,19 @@ class BezierfitParticleMembraneSubtract:
                 particle_idxes, psis, pixel_sizes, shifts, classes
             ):
                 class_key = str(int(class_))
-                control_points = np.array(self._control_points_dict[class_key])
+                if class_key not in self._control_points_dict:
+                    raise ValueError(
+                        f"Missing control points for class_id={class_key}. "
+                        f"Available keys: {sorted(list(self._control_points_dict.keys()))[:10]}"
+                    )
+                control_points = np.asarray(self._control_points_dict[class_key], dtype=np.float32)
+                if control_points.ndim != 2 or control_points.shape[1] != 2 or control_points.shape[0] < 4:
+                    raise ValueError(
+                        f"Invalid control points for class_id={class_key}: expected shape (N,2) with N>=4, "
+                        f"got shape={control_points.shape}"
+                    )
+                if not np.isfinite(control_points).all():
+                    raise ValueError(f"Control points contain NaN/Inf for class_id={class_key}")
 
                 if particle_stack.ndim == 2:
                     subtractor = MembraneSubtract(
@@ -387,8 +399,9 @@ class BezierfitParticleMembraneSubtract:
                     raise ValueError(f"Unsupported particle stack ndim={particle_stack.ndim} for {raw_stack}")
 
                 del subtractor
-                cp.cuda.Stream.null.synchronize()
-                cp.get_default_memory_pool().free_all_blocks()
+
+            # Fail-fast: surface any pending async CUDA errors before writing to disk.
+            cp.cuda.Stream.null.synchronize()
 
             # Atomic output write + `.mxt` sidecar (Spec v1).
             write_mrc_atomic(out_stack, subtracted_particle_stack)

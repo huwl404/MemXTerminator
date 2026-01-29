@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import cupy as cp
 import cupyx.scipy.ndimage
@@ -10,6 +12,79 @@ import time
 
 
 _DISTRIBUTE_BILINEAR_BATCH_KERNEL = None
+
+
+def _matrix_norm_1_batch(arr: cp.ndarray) -> cp.ndarray:
+    """
+    Compute the induced matrix 1-norm for a batch of 2D arrays.
+
+    `cp.linalg.norm(A, ord=1)` for a 2D matrix A is the maximum absolute column sum.
+    This helper supports a leading batch dimension:
+
+        arr: (B, H, W) -> out: (B,)
+    """
+    if arr.ndim != 3:
+        raise ValueError(f"Expected arr.ndim == 3 (B,H,W), got {arr.ndim}")
+    col_sums = cp.sum(cp.abs(arr), axis=1)  # (B, W)
+    return cp.max(col_sums, axis=1)  # (B,)
+
+
+def _select_best_scaling_factor(
+    *,
+    image_conv: cp.ndarray,
+    average_conv: cp.ndarray,
+    mem_mask: cp.ndarray,
+    scaling_factor_lst: list[float] | None = None,
+    max_bytes: int = 256 * 1024 * 1024,
+) -> tuple[float, int]:
+    """
+    Select the best scaling factor by minimizing the induced matrix 1-norm.
+
+    This matches the historical behavior in `MembraneSubtract.mem_subtract()`:
+    - factors are `np.arange(0.01, 1, 0.02)` (unless overridden)
+    - metric is `cp.linalg.norm(A, ord=1)` for 2D A, i.e. max column sum
+    - ties must pick the first minimum factor (np.argmin semantics)
+    """
+    if scaling_factor_lst is None:
+        scaling_factor_lst = list(np.arange(0.01, 1, 0.02))
+    if not scaling_factor_lst:
+        raise ValueError("scaling_factor_lst is empty")
+
+    # Keep exact factor ordering and preserve numpy-style tie-breaking.
+    scaling_factors = cp.asarray(scaling_factor_lst, dtype=image_conv.dtype)
+    num_factors = int(scaling_factors.size)
+    height, width = int(image_conv.shape[0]), int(image_conv.shape[1])
+
+    bytes_per_elem = int(image_conv.dtype.itemsize)
+    est_bytes = num_factors * height * width * bytes_per_elem
+
+    if est_bytes <= int(max_bytes):
+        arr = (image_conv[cp.newaxis, :, :] - average_conv[cp.newaxis, :, :] * scaling_factors[:, cp.newaxis, cp.newaxis]) * mem_mask[
+            cp.newaxis, :, :
+        ]
+        l1_vals = _matrix_norm_1_batch(arr)
+        best_idx = int(cp.argmin(l1_vals).get())
+        return scaling_factor_lst[best_idx], best_idx
+
+    elems_per_factor = max(1, height * width)
+    max_factors_per_chunk = max(1, int(max_bytes) // (bytes_per_elem * elems_per_factor))
+
+    best_idx = 0
+    best_val = None
+    for start in range(0, num_factors, max_factors_per_chunk):
+        f_chunk = scaling_factors[start : start + max_factors_per_chunk]
+        arr = (image_conv[cp.newaxis, :, :] - average_conv[cp.newaxis, :, :] * f_chunk[:, cp.newaxis, cp.newaxis]) * mem_mask[
+            cp.newaxis, :, :
+        ]
+        l1_vals = _matrix_norm_1_batch(arr)
+        chunk_argmin = int(cp.argmin(l1_vals).get())
+        chunk_best_val = float(l1_vals[chunk_argmin].get())
+        cand_idx = int(start + chunk_argmin)
+        if best_val is None or chunk_best_val < best_val or (chunk_best_val == best_val and cand_idx < best_idx):
+            best_val = chunk_best_val
+            best_idx = cand_idx
+
+    return scaling_factor_lst[best_idx], best_idx
 
 
 def _get_distribute_bilinear_batch_kernel() -> cp.RawKernel:
@@ -222,13 +297,28 @@ class MembraneSubtract:
         self.image_sz = self.image.shape[0]
         self.xc = self.image.shape[0] // 2
         self.yc = self.image.shape[1] // 2
-        self.pixel_size = pixel_size
+        self.pixel_size = float(pixel_size)
+        if self.pixel_size <= 0:
+            raise ValueError(f"pixel_size must be > 0, got {pixel_size!r}")
+        physical_membrane_dist = float(physical_membrane_dist)
+        if physical_membrane_dist <= 0:
+            raise ValueError(f"physical_membrane_dist must be > 0, got {physical_membrane_dist!r}")
         self.mem_dist = int(physical_membrane_dist / self.pixel_size)
+        if self.mem_dist < 1:
+            raise ValueError(
+                f"mem_dist must be >= 1 (physical_membrane_dist/pixel_size), got mem_dist={self.mem_dist} "
+                f"from physical_membrane_dist={physical_membrane_dist} pixel_size={self.pixel_size}"
+            )
         self.psi = psi
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.control_points = control_points
-        self.points_step = points_step
+        self.points_step = float(points_step)
+        if self.points_step <= 0:
+            raise ValueError(f"points_step must be > 0, got {points_step!r}")
+        # This is a conservative guardrail; the Bezier parameter t-range is typically ~[0,1].
+        if self.points_step > 1.0:
+            raise ValueError(f"points_step must be <= 1.0, got {points_step!r}")
 
     def control_points_trasf(self, control_points, psi, origin_x, origin_y):
         for control_point in control_points:
@@ -253,21 +343,69 @@ class MembraneSubtract:
         return membrane_mask
 
     def average_1d(self, image_gpu, fitted_points, normals, mem_dist):
-        average_1d_lst = []
+        """
+        Compute per-distance mean gray values along curve normals (GPU).
+
+        Semantics (guardrails):
+        - Out-of-bounds points are excluded from the mean (not treated as zeros).
+        - Any NaNs produced by interpolation are converted to 0 before averaging.
+        - Empty-mask distances (zero in-bounds points) return 0.0 (not NaN).
+        """
+        mem_dist = int(mem_dist)
+        if mem_dist < 0:
+            raise ValueError(f"mem_dist must be >= 0, got {mem_dist}")
+
         fitted_points = cp.asarray(fitted_points, dtype=cp.float32)
         normals = cp.asarray(normals, dtype=cp.float32)
-        for membrane_dist in range(-mem_dist, mem_dist+1):
-            normals_points = fitted_points + membrane_dist * normals
-            # Ensure the points are within the image boundaries
-            mask = (normals_points[:, 0] >= 0) & (normals_points[:, 0] < image_gpu.shape[1]) & \
-                (normals_points[:, 1] >= 0) & (normals_points[:, 1] < image_gpu.shape[0])
-            normals_points = normals_points[mask]
-            # Get interpolated gray values for the normal points
-            interpolated_values = bilinear_interpolation_gpu(image_gpu, normals_points[:, 0], normals_points[:, 1])
-            # Keep computations on GPU to avoid implicit host transfers via NumPy.
-            interpolated_values = cp.nan_to_num(interpolated_values)
-            average_1d_lst.append(float(cp.mean(interpolated_values).get()))
-        return average_1d_lst
+        dists = cp.arange(-mem_dist, mem_dist + 1, dtype=cp.float32)  # (D,)
+
+        if fitted_points.size == 0:
+            # Degenerate path: no points, no contribution.
+            return cp.zeros((int(dists.size),), dtype=cp.float32)
+
+        num_points = int(fitted_points.shape[0])
+        num_dists = int(dists.size)
+
+        # Hard cap to avoid enormous temporary allocations; chunk over distances if needed.
+        # Typical values are small (e.g. ~O(1e4) total points).
+        max_elements = 50_000_000
+        total_elements = num_points * num_dists
+
+        def _compute_chunk(d_chunk: cp.ndarray) -> cp.ndarray:
+            # normals_points: (D, P, 2)
+            normals_points = fitted_points[cp.newaxis, :, :] + d_chunk[:, cp.newaxis, cp.newaxis] * normals[
+                cp.newaxis, :, :
+            ]
+            xs = normals_points[:, :, 0]
+            ys = normals_points[:, :, 1]
+
+            in_bounds = (xs >= 0) & (xs < float(image_gpu.shape[1])) & (ys >= 0) & (ys < float(image_gpu.shape[0]))
+
+            # Sample all points in one shot (including OOB coordinates); OOB values are ignored via `in_bounds`.
+            coords = cp.stack((ys.reshape(-1), xs.reshape(-1)), axis=0)
+            vals = cupyx.scipy.ndimage.map_coordinates(image_gpu, coords, order=1, mode="constant", cval=0.0)
+            vals = vals.reshape(int(d_chunk.size), num_points)
+            vals = cp.nan_to_num(vals)
+
+            mask_f = in_bounds.astype(cp.float32, copy=False)
+            sums = cp.sum(vals * mask_f, axis=1, dtype=cp.float64)
+            counts = cp.sum(mask_f, axis=1, dtype=cp.float64)
+
+            # Empty-mask distances must be 0.0 (not NaN).
+            means = cp.zeros_like(sums, dtype=cp.float64)
+            nonzero = counts > 0
+            means[nonzero] = sums[nonzero] / counts[nonzero]
+            return means.astype(cp.float32, copy=False)
+
+        if total_elements <= max_elements:
+            return _compute_chunk(dists)
+
+        # Chunk over distances to cap D*P temporary size.
+        chunk_size = max(1, max_elements // max(1, num_points))
+        chunks = []
+        for start in range(0, num_dists, chunk_size):
+            chunks.append(_compute_chunk(dists[start : start + chunk_size]))
+        return cp.concatenate(chunks, axis=0)
     # def average_1d_gpu(self, image_gpu, fitted_points, normals, extra_mem_dist):
     #     average_1d_lst = []
     #     fitted_points = cp.asarray(fitted_points)
@@ -391,6 +529,11 @@ class MembraneSubtract:
     def mem_subtract(self):
         control_points = self.control_points_trasf(self.control_points, self.psi, self.origin_x, self.origin_y)
         fitted_curve_points, t_values = generate_curve_within_boundaries(control_points, self.image.shape, self.points_step)
+        if getattr(fitted_curve_points, "size", 0) == 0 or getattr(t_values, "size", 0) == 0:
+            raise ValueError(
+                "No curve points within image boundaries; cannot subtract membrane. "
+                f"image_shape={self.image.shape} points_step={self.points_step}"
+            )
         extra_mem_dist = 10
         mem_mask = self.generate_2d_mask(self.image_gpu, fitted_curve_points, self.mem_dist)
         normals = points_along_normal(control_points, t_values)
@@ -412,15 +555,11 @@ class MembraneSubtract:
         image_conv = convolve2d(self.image_gpu, kernel, mode = 'same')
         raw_image_average_2d_conv = convolve2d(raw_image_average_2d, kernel, mode = 'same')
         bias = 0
-        scaling_factor_lst = [i for i in np.arange(0.01, 1, 0.02)]
-        l1_lst = []
-        for i in scaling_factor_lst:
-            mem_subtracted = image_conv - raw_image_average_2d_conv * i
-            l1 = cp.linalg.norm((mem_subtracted * mem_mask), ord=1)
-            l1_lst.append(l1)
-        l1_lst = [item.get() for item in l1_lst]
-        l1_np_array = np.array(l1_lst)
-        best_scaling_factor = scaling_factor_lst[np.argmin(l1_np_array)]
+        best_scaling_factor, _best_idx = _select_best_scaling_factor(
+            image_conv=image_conv,
+            average_conv=raw_image_average_2d_conv,
+            mem_mask=mem_mask,
+        )
         mem_subtracted = self.image_gpu - raw_image_average_2d * (best_scaling_factor + bias)
         return mem_subtracted
         # plt.figure(figsize=(10, 5))
@@ -460,3 +599,4 @@ if '__main__' == __name__:
     origin_x = -4.225000
     origin_y = 4.875000
     MembraneSubtract(control_points, rawimage_filename, section, psi, origin_x, origin_y, 1.068000).mem_subtract()
+    

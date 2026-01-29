@@ -537,7 +537,9 @@ class MicrographMembraneSubtract:
             del subtracted_images
             del df_rawimage_temp
             cp.cuda.Stream.null.synchronize()
-            cp.cuda.MemoryPool().free_all_blocks()
+            # Free cached blocks from the *default* CuPy pool. Creating a new MemoryPool()
+            # and freeing it is a no-op for existing allocations.
+            cp.get_default_memory_pool().free_all_blocks()
         except Exception as exc:
             finished_utc = datetime.now(timezone.utc).isoformat()
             duration = time.time() - started_wall

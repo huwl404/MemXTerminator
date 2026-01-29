@@ -57,4 +57,6 @@ if __name__ == '__main__':
         with open(args.output, 'w') as f:
             json.dump(control_points_with_idx, f)
             f.write('\n')
-        cp.cuda.MemoryPool().free_all_blocks()
+        # Free cached blocks from the *default* CuPy pool. Creating a new MemoryPool()
+        # and freeing it is a no-op for existing allocations.
+        cp.get_default_memory_pool().free_all_blocks()

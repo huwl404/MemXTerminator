@@ -86,7 +86,33 @@ def evaluate_individual(ind, obj, base_image):
     # assert len(ind) == 8, f"Unexpected length of individual: {len(ind)}"
     return (obj.cross_correlation_fitness(np.array(ind).reshape(obj.degree+1, 2), base_image, obj.penalty_threshold),)
 def init_cuda():
-    x = cp.array([1, 2, 3])
+    """
+    Multiprocessing worker initializer for GA_Refine.
+
+    GA_Refine fitness evaluation uses CuPy. When running with multiple worker
+    processes and multiple visible CUDA devices, we pin each worker to a GPU in
+    round-robin order (matching the strategy used in other MemXTerminator
+    multiprocessing paths).
+
+    NOTE: This initializer must run before any CuPy allocations in the worker.
+    """
+    try:
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        device_count = 0
+
+    if device_count > 0:
+        try:
+            ident = getattr(multiprocessing.current_process(), "_identity", ())
+            worker_rank = int(ident[0]) if ident else 1  # 1-based in multiprocessing pools
+            device_id = (worker_rank - 1) % device_count
+            cp.cuda.Device(device_id).use()
+        except Exception:
+            # Best-effort pinning; never crash an optimization run due to pinning logic.
+            pass
+
+    # Force CUDA context initialization on the selected device.
+    x = cp.array([1], dtype=cp.int8)
     del x
 
 def cupy_cdist(XA, XB):
@@ -268,6 +294,8 @@ class GA_Refine:
         return best_control_points
 
 def generate_curve_within_boundaries(control_points, image_shape, step):
+    if step <= 0:
+        raise ValueError(f"step must be > 0, got {step!r}")
     t_values = []
     t = 0
 
@@ -278,6 +306,12 @@ def generate_curve_within_boundaries(control_points, image_shape, step):
             t_values.append(t)
             break
         t += step
+
+    if not t_values:
+        raise ValueError(
+            "No Bezier curve points fall within image boundaries. "
+            f"image_shape={image_shape} step={step}"
+        )
 
     # Generate curve points moving forward
     while True:

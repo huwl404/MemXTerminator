@@ -29,6 +29,44 @@ from memxterminator.mxt_state import (
     write_mrc_atomic,
 )
 
+_WORKER_RUNNER = None
+
+
+def _init_worker(config: dict) -> None:
+    """
+    Per-process initializer for multiprocessing workers.
+
+    We build the runner inside each worker to avoid pickling large state (STAR
+    DataFrames, cached weights/masks, etc.) for every task.
+    """
+    global _WORKER_RUNNER
+
+    # Best-effort: pin each worker to a GPU in round-robin order if multiple
+    # CUDA devices are visible. Users can still control visibility via
+    # CUDA_VISIBLE_DEVICES.
+    try:
+        import cupy as cp
+
+        device_count = int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        device_count = 0
+    if device_count > 0:
+        try:
+            ident = getattr(multiprocessing.current_process(), "_identity", ())
+            worker_rank = int(ident[0]) if ident else 1  # 1-based in multiprocessing pools
+            device_id = (worker_rank - 1) % device_count
+            cp.cuda.Device(device_id).use()
+        except Exception:
+            pass
+
+    _WORKER_RUNNER = MicrographMembraneSubtract(**config)
+
+
+def _process_micrograph_worker(raw_mg_name: tuple[str, str]) -> None:
+    if _WORKER_RUNNER is None:
+        raise RuntimeError("Worker runner not initialized")
+    _WORKER_RUNNER.process_micrograph_mem_subtract(raw_mg_name)
+
 
 def _append_event_log(level: str, event: str, **fields: object) -> None:
     """
@@ -490,32 +528,68 @@ class MicrographMembraneSubtract:
             weight_sum_image = cp.zeros_like(micrograph)
             mem_mosaic_image_mask = cp.zeros_like(micrograph)
 
-            subtracted_images = []
             df_rawimage_temp = self.get_df_temp(rawimage_stacks_name)
             for df_rawimage_temp_section_num, df_rawimage_temp_X_Y in self.get_df_temp_X_Y(df_rawimage_temp).items():
-                subtracted_image_temp = subtracted_images_stacks[df_rawimage_temp_section_num - 1]
-                X, Y = df_rawimage_temp_X_Y
-                particle_be_replaced = micrograph[
-                    Y - self.rawimage_size // 2 : Y + self.rawimage_size // 2,
-                    X - self.rawimage_size // 2 : X + self.rawimage_size // 2,
-                ]
-                subtracted_image_temp = -subtracted_image_temp
-                subtracted_image_temp = (
-                    (subtracted_image_temp - cp.mean(subtracted_image_temp))
-                    / cp.std(subtracted_image_temp)
+                # STAR provides 1-based section indices.
+                section_1based = int(df_rawimage_temp_section_num)
+                idx0 = section_1based - 1
+                if idx0 < 0 or idx0 >= int(subtracted_images_stacks.shape[0]):
+                    raise ValueError(
+                        f"STAR section index out of bounds: section_1based={section_1based} "
+                        f"stack_len={int(subtracted_images_stacks.shape[0])} stack={rawimage_stacks_name}"
+                    )
+
+                subtracted_image_temp_full = subtracted_images_stacks[idx0]
+                x_center, y_center = df_rawimage_temp_X_Y
+
+                # Coordinates should be integer pixel indices; enforce int conversion to
+                # avoid implicit float slicing errors.
+                x_center = int(x_center)
+                y_center = int(y_center)
+
+                half = int(self.rawimage_size) // 2
+                row0 = y_center - half
+                col0 = x_center - half
+                row1 = row0 + int(self.rawimage_size)
+                col1 = col0 + int(self.rawimage_size)
+
+                # Clamp box to micrograph bounds to avoid negative-index wraparound.
+                mg_h, mg_w = int(micrograph.shape[0]), int(micrograph.shape[1])
+                row0_c = max(row0, 0)
+                col0_c = max(col0, 0)
+                row1_c = min(row1, mg_h)
+                col1_c = min(col1, mg_w)
+
+                if row0_c >= row1_c or col0_c >= col1_c:
+                    raise ValueError(
+                        f"Zero-area micrograph box after clamping: center=({x_center},{y_center}) "
+                        f"box={int(self.rawimage_size)} micrograph_shape={micrograph.shape} "
+                        f"clamped_rows=({row0_c},{row1_c}) clamped_cols=({col0_c},{col1_c})"
+                    )
+
+                # Corresponding slice in the particle/subtracted-image box.
+                pr0 = row0_c - row0
+                pc0 = col0_c - col0
+                pr1 = pr0 + (row1_c - row0_c)
+                pc1 = pc0 + (col1_c - col0_c)
+
+                particle_be_replaced = micrograph[row0_c:row1_c, col0_c:col1_c]
+                sub_patch = -subtracted_image_temp_full[pr0:pr1, pc0:pc1]
+
+                # Match per-particle contrast/scale to the micrograph crop (baseline behavior).
+                sub_patch = (
+                    (sub_patch - cp.mean(sub_patch))
+                    / cp.std(sub_patch)
                     * cp.std(particle_be_replaced)
                     + cp.mean(particle_be_replaced)
                 )
-                subtracted_images.append((subtracted_image_temp, (Y, X)))
 
-            for subtracted_image, center in subtracted_images:
-                start_x = center[0] - self.rawimage_size // 2
-                start_y = center[1] - self.rawimage_size // 2
-                mem_mosaic_image[start_x : start_x + self.rawimage_size, start_y : start_y + self.rawimage_size] += (
-                    subtracted_image * self.weights
-                )
-                weight_sum_image[start_x : start_x + self.rawimage_size, start_y : start_y + self.rawimage_size] += self.weights
-                mem_mosaic_image_mask[start_x : start_x + self.rawimage_size, start_y : start_y + self.rawimage_size] = self.mask
+                weights_patch = self.weights[pr0:pr1, pc0:pc1]
+                mask_patch = self.mask[pr0:pr1, pc0:pc1]
+
+                mem_mosaic_image[row0_c:row1_c, col0_c:col1_c] += sub_patch * weights_patch
+                weight_sum_image[row0_c:row1_c, col0_c:col1_c] += weights_patch
+                mem_mosaic_image_mask[row0_c:row1_c, col0_c:col1_c] = mask_patch
 
             epsilon = float(self.mxt_params["epsilon"])
             weight_sum_image = cp.where(weight_sum_image == 0, epsilon, weight_sum_image)
@@ -553,10 +627,9 @@ class MicrographMembraneSubtract:
             del mem_mosaic_image
             del weight_sum_image
             del mem_mosaic_image_mask
-            del subtracted_images
             del df_rawimage_temp
             cp.cuda.Stream.null.synchronize()
-            cp.cuda.MemoryPool().free_all_blocks()
+            cp.get_default_memory_pool().free_all_blocks()
         except Exception as exc:
             finished_utc = datetime.now(timezone.utc).isoformat()
             duration = time.time() - started_wall
@@ -597,26 +670,37 @@ class MicrographMembraneSubtract:
     
     def micrograph_mem_subtract_multiprocessing(self, num_cpus, batch_size):
         try:
-            multiprocessing.set_start_method('spawn')
+            multiprocessing.set_start_method("spawn")
         except RuntimeError:
+            # Start method can only be set once per interpreter.
             pass
+
         def chunks(lst, n):
             for i in range(0, len(lst), n):
-                yield lst[i:i + n]
+                yield lst[i : i + n]
 
-        print('>>> Preparing Micrograph Membrane Subtraction dataset...')
-        print(f'>>> Found {len(self.raw_mg_name_lst)} raw micrographs in total.')
-        minibatches = list(chunks(self.raw_mg_name_lst, batch_size))
-        i = 1
+        print(">>> Preparing Micrograph Membrane Subtraction dataset...")
+        print(f">>> Found {len(self.raw_mg_name_lst)} raw micrographs in total.")
+
+        worker_config = {
+            "particles_selected_filename": self.particles_selected_filename,
+            "resume": bool(self.resume),
+            "force": bool(self.force),
+            "adopt_existing_outputs": bool(self.adopt_existing_outputs),
+            "skip_failed": bool(self.skip_failed),
+            "require_particle_mxt": bool(self.require_particle_mxt),
+            "strict_output_check": bool(self.strict_output_check),
+        }
+
+        minibatches = list(chunks(self.raw_mg_name_lst, int(batch_size)))
         total_len = len(minibatches)
-        for minibatch in minibatches:
-            with Pool(num_cpus) as p:
+        with Pool(processes=int(num_cpus), initializer=_init_worker, initargs=(worker_config,)) as p:
+            for i, minibatch in enumerate(minibatches, start=1):
                 start_time = time.time()
-                p.map(self.process_micrograph_mem_subtract, minibatch)
+                p.map(_process_micrograph_worker, minibatch, chunksize=1)
                 end_time = time.time()
-                print(f'>>> {i} / {total_len} minibatch finished.')
+                print(f">>> {i} / {total_len} minibatch finished.")
                 print(f">>> {len(minibatch)} micrograph stacks took {end_time - start_time:.4f} seconds.")
-                i += 1
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Micrograph membrane subtraction')
