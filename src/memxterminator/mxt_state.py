@@ -209,6 +209,67 @@ def to_subtracted_stack_path(stack_path: os.PathLike[str] | str) -> str:
     return str(mapped_dir / mapped_name)
 
 
+def to_subtracted_stack_path_in_root(
+    stack_path: os.PathLike[str] | str,
+    *,
+    output_root: os.PathLike[str] | str | None = None,
+) -> str:
+    """
+    Like `to_subtracted_stack_path`, but optionally place outputs under `output_root`.
+
+    This is the key primitive that enables safe parameter sweeps / batch runs on
+    the same input data without output collisions.
+
+    Rules:
+    - If `output_root` is None: return `to_subtracted_stack_path(stack_path)` unchanged.
+    - Else: preserve the relative subtree starting at the first `subtracted/`
+      segment if present; otherwise, place the mapped filename under
+      `<output_root>/subtracted/`.
+    """
+    base = Path(to_subtracted_stack_path(stack_path))
+    if output_root is None:
+        return str(base)
+
+    out_root = Path(_normalise_path(output_root))
+    parts_lower = [p.lower() for p in base.parts]
+    try:
+        sub_idx = parts_lower.index("subtracted")
+    except ValueError:
+        sub_idx = -1
+
+    if sub_idx >= 0:
+        return str(out_root / Path(*base.parts[sub_idx:]))
+    return str(out_root / "subtracted" / base.name)
+
+
+def to_subtracted_micrograph_path(
+    micrograph_path: os.PathLike[str] | str,
+    *,
+    output_root: os.PathLike[str] | str | None = None,
+) -> str:
+    """
+    Derive a micrograph subtraction output path for Bezierfit micrograph MMS.
+
+    - Output name: `<stem>_subtracted<suffix>` (idempotent if already suffixed)
+    - Default output dir (Spec v1 legacy): `<micrograph>/../.. / subtracted`
+    - If `output_root` is provided: `<output_root>/subtracted/<name>`
+    """
+    p = Path(_normalise_path(micrograph_path))
+    suffix = p.suffix
+    stem = p.stem
+    if stem.lower().endswith("_subtracted"):
+        out_name = f"{stem}{suffix}"
+    else:
+        out_name = f"{stem}_subtracted{suffix}"
+
+    if output_root is None:
+        out_dir = p.parent.parent / "subtracted"
+    else:
+        out_dir = Path(_normalise_path(output_root)) / "subtracted"
+
+    return str(out_dir / out_name)
+
+
 def is_uptodate(
     output_path: os.PathLike[str] | str,
     mxt_path: os.PathLike[str] | str,
@@ -420,5 +481,13 @@ if __name__ == "__main__":
     assert parse_relion_image_name_1based("foo.mrc") == ("foo.mrc", 1)
     assert to_subtracted_stack_path("/a/extract/x.mrc") == "/a/subtracted/x_subtracted.mrc"
     assert to_subtracted_stack_path("/a/subtracted/x_subtracted.mrc") == "/a/subtracted/x_subtracted.mrc"
+    assert (
+        to_subtracted_stack_path_in_root("/a/extract/x.mrc", output_root="/tmp/run1")
+        == "/tmp/run1/subtracted/x_subtracted.mrc"
+    )
+    assert (
+        to_subtracted_micrograph_path("/a/micrographs/extract/mg_001.mrc", output_root="/tmp/run2")
+        == "/tmp/run2/subtracted/mg_001_subtracted.mrc"
+    )
     assert compute_params_hash({"b": 1, "a": 2}) == compute_params_hash({"a": 2, "b": 1})
     print("memxterminator.mxt_state: self-test OK")

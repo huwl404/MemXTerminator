@@ -23,13 +23,15 @@ from memxterminator.mxt_state import (
     parse_relion_image_name_1based,
     read_mxt,
     release_lock,
-    to_subtracted_stack_path,
+    to_subtracted_micrograph_path,
+    to_subtracted_stack_path_in_root,
     try_acquire_lock,
     write_json_atomic,
     write_mrc_atomic,
 )
 
 _WORKER_RUNNER = None
+_EVENT_LOG_PATH: str | None = None
 
 
 def _init_worker(config: dict) -> None:
@@ -40,6 +42,7 @@ def _init_worker(config: dict) -> None:
     DataFrames, cached weights/masks, etc.) for every task.
     """
     global _WORKER_RUNNER
+    global _EVENT_LOG_PATH
 
     # Best-effort: pin each worker to a GPU in round-robin order if multiple
     # CUDA devices are visible. Users can still control visibility via
@@ -58,6 +61,15 @@ def _init_worker(config: dict) -> None:
             cp.cuda.Device(device_id).use()
         except Exception:
             pass
+
+    output_root = config.get("output_root")
+    if output_root:
+        try:
+            _EVENT_LOG_PATH = os.fspath(output_root) + os.sep + "mms_run_data.log"
+        except Exception:
+            _EVENT_LOG_PATH = None
+    else:
+        _EVENT_LOG_PATH = "mms_run_data.log"
 
     _WORKER_RUNNER = MicrographMembraneSubtract(**config)
 
@@ -85,7 +97,11 @@ def _append_event_log(level: str, event: str, **fields: object) -> None:
 
     line = " ".join(parts)
     try:
-        with open("mms_run_data.log", "a", encoding="utf-8") as f:
+        path = _EVENT_LOG_PATH or "mms_run_data.log"
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         # Best-effort: logging must never crash workers.
@@ -129,6 +145,7 @@ class MicrographMembraneSubtract:
         skip_failed: bool = False,
         require_particle_mxt: bool = True,
         strict_output_check: bool = True,
+        output_root: str | None = None,
     ):
         self.particles_selected_filename = particles_selected_filename
 
@@ -138,6 +155,7 @@ class MicrographMembraneSubtract:
         self.skip_failed = bool(skip_failed)
         self.require_particle_mxt = bool(require_particle_mxt)
         self.strict_output_check = bool(strict_output_check)
+        self.output_root = output_root
 
         # `.mxt` stable params/hash for this invocation (pixel-affecting only).
         self.mxt_task = "bezierfit_micrograph_mms"
@@ -284,7 +302,9 @@ class MicrographMembraneSubtract:
         setproctitle("MemXTerminator-MMS")
         rawimage_stacks_name, micrograph_name = raw_mg_name
 
-        particle_stack_subtracted_path = to_subtracted_stack_path(rawimage_stacks_name)
+        particle_stack_subtracted_path = to_subtracted_stack_path_in_root(
+            rawimage_stacks_name, output_root=self.output_root
+        )
         particle_stack_mxt_path = particle_stack_subtracted_path + ".mxt"
 
         if not os.path.exists(particle_stack_subtracted_path):
@@ -377,9 +397,7 @@ class MicrographMembraneSubtract:
                 except Exception:
                     particle_pms_params_hash = None
 
-        out_dir = Path(micrograph_name).parent.parent / "subtracted"
-        out_path = out_dir / (Path(micrograph_name).stem + "_subtracted" + Path(micrograph_name).suffix)
-        out_micrograph = str(out_path)
+        out_micrograph = to_subtracted_micrograph_path(micrograph_name, output_root=self.output_root)
         mxt_path = out_micrograph + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -690,6 +708,7 @@ class MicrographMembraneSubtract:
             "skip_failed": bool(self.skip_failed),
             "require_particle_mxt": bool(self.require_particle_mxt),
             "strict_output_check": bool(self.strict_output_check),
+            "output_root": self.output_root,
         }
 
         minibatches = list(chunks(self.raw_mg_name_lst, int(batch_size)))
@@ -714,10 +733,19 @@ if __name__ == '__main__':
     parser.add_argument(
         "--procs",
         type=int,
-        default=15,
-        help="Number of worker processes to run micrograph stacks in parallel. (default: 15)",
+        default=0,
+        help=(
+            "Number of worker processes to run micrograph stacks in parallel. "
+            "Use 0 to auto-detect from visible GPUs. (default: 0)"
+        ),
     )
     parser.add_argument('--batch_size', type=int, default=30)
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help="If set, read/write all outputs under <output_root>/subtracted/... (isolates sweeps/batches).",
+    )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -749,6 +777,14 @@ if __name__ == '__main__':
         help="Require dependency particle-stack .mxt sidecars to exist and be success (default: enabled).",
     )
     args = parser.parse_args()
+    if args.output_root:
+        try:
+            _EVENT_LOG_PATH = os.fspath(args.output_root) + os.sep + "mms_run_data.log"
+        except Exception:
+            _EVENT_LOG_PATH = None
+    else:
+        _EVENT_LOG_PATH = "mms_run_data.log"
+
     mms = MicrographMembraneSubtract(
         args.particles_selected_filename,
         resume=args.resume,
@@ -756,5 +792,16 @@ if __name__ == '__main__':
         adopt_existing_outputs=args.adopt_existing_outputs,
         skip_failed=args.skip_failed,
         require_particle_mxt=args.require_particle_mxt,
+        output_root=args.output_root,
     )
-    mms.micrograph_mem_subtract_multiprocessing(args.procs, args.batch_size)
+
+    procs = int(args.procs)
+    if procs <= 0:
+        try:
+            import cupy as _cp
+
+            procs = int(_cp.cuda.runtime.getDeviceCount())
+        except Exception:
+            procs = 1
+
+    mms.micrograph_mem_subtract_multiprocessing(procs, args.batch_size)

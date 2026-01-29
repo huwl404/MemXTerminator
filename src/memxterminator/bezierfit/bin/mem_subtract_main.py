@@ -21,7 +21,7 @@ from memxterminator.mxt_state import (
     is_uptodate,
     read_mxt,
     release_lock,
-    to_subtracted_stack_path,
+    to_subtracted_stack_path_in_root,
     try_acquire_lock,
     write_json_atomic,
     write_mrc_atomic,
@@ -29,6 +29,7 @@ from memxterminator.mxt_state import (
 
 
 _WORKER_RUNNER = None
+_EVENT_LOG_PATH: str | None = None
 
 
 def _chunks(lst: list[str], n: int):
@@ -47,6 +48,15 @@ def _init_worker(config: dict) -> None:
     """
     global _WORKER_RUNNER
     _WORKER_RUNNER = BezierfitParticleMembraneSubtract(**config)
+    global _EVENT_LOG_PATH
+    output_root = config.get("output_root")
+    if output_root:
+        try:
+            _EVENT_LOG_PATH = os.fspath(output_root) + os.sep + "bezfit_pms_run_data.log"
+        except Exception:
+            _EVENT_LOG_PATH = None
+    else:
+        _EVENT_LOG_PATH = "bezfit_pms_run_data.log"
 
     # Best-effort: pin each worker to a GPU in round-robin order if multiple
     # CUDA devices are visible. Users can still control visibility via
@@ -90,7 +100,11 @@ def _append_event_log(level: str, event: str, **fields: object) -> None:
 
     line = " ".join(parts)
     try:
-        with open("bezfit_pms_run_data.log", "a", encoding="utf-8") as f:
+        path = _EVENT_LOG_PATH or "bezfit_pms_run_data.log"
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
         # Best-effort: logging must never crash workers.
@@ -127,6 +141,7 @@ class BezierfitParticleMembraneSubtract:
         adopt_existing_outputs: bool = False,
         skip_failed: bool = False,
         strict_output_check: bool = True,
+        output_root: str | None = None,
     ):
         self.particle_cs = particle_cs
         self.template_cs = template_cs
@@ -137,6 +152,7 @@ class BezierfitParticleMembraneSubtract:
         self.adopt_existing_outputs = bool(adopt_existing_outputs)
         self.skip_failed = bool(skip_failed)
         self.strict_output_check = bool(strict_output_check)
+        self.output_root = output_root
 
         self.mxt_task = "bezierfit_particle_pms"
         self.mxt_params = {
@@ -231,7 +247,7 @@ class BezierfitParticleMembraneSubtract:
         setproctitle("MemXTerminator-bezPMS")
 
         raw_stack = particle_filename
-        out_stack = to_subtracted_stack_path(raw_stack)
+        out_stack = to_subtracted_stack_path_in_root(raw_stack, output_root=self.output_root)
         mxt_path = out_stack + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -481,6 +497,12 @@ def main() -> None:
     parser.add_argument("--points_step", type=float, default=0.005)
     parser.add_argument("--physical_membrane_dist", type=int, default=35)
     parser.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help="If set, write all outputs under <output_root>/subtracted/... (isolates sweeps/batches).",
+    )
+    parser.add_argument(
         "--procs",
         type=int,
         default=1,
@@ -522,6 +544,14 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    global _EVENT_LOG_PATH
+    if args.output_root:
+        try:
+            _EVENT_LOG_PATH = os.fspath(args.output_root) + os.sep + "bezfit_pms_run_data.log"
+        except Exception:
+            _EVENT_LOG_PATH = None
+    else:
+        _EVENT_LOG_PATH = "bezfit_pms_run_data.log"
 
     runner = BezierfitParticleMembraneSubtract(
         particle_cs=args.particle,
@@ -533,6 +563,7 @@ def main() -> None:
         force=args.force,
         adopt_existing_outputs=args.adopt_existing_outputs,
         skip_failed=args.skip_failed,
+        output_root=args.output_root,
     )
 
     print(">>> Preparing Bezierfit Particle Membrane Subtraction dataset...")
@@ -572,6 +603,7 @@ def main() -> None:
         "force": bool(args.force),
         "adopt_existing_outputs": bool(args.adopt_existing_outputs),
         "skip_failed": bool(args.skip_failed),
+        "output_root": args.output_root,
     }
 
     minibatches = list(_chunks(stack_paths, batch_size))

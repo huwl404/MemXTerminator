@@ -10,41 +10,9 @@ import mrcfile
 import subprocess
 import shlex
 import sys
-import signal
 
 from ._deps import check_cupy_cuda_available
-
-
-def _popen_kwargs_for_new_session() -> dict:
-    # On POSIX, start the subprocess in its own session so we can safely
-    # terminate the entire process group (parent + multiprocessing workers).
-    if os.name == "posix":
-        return {"start_new_session": True}
-    return {}
-
-
-def _terminate_pid(pid: int) -> None:
-    """
-    Best-effort terminate a subprocess (and its worker children when possible).
-
-    - If the process is the leader of its own process group (pgid == pid),
-      terminate the whole group.
-    - Otherwise, fall back to terminating only the PID.
-    """
-    if pid <= 0:
-        return
-    try:
-        if os.name == "posix":
-            try:
-                pgid = os.getpgid(pid)
-                if pgid == pid:
-                    os.killpg(pgid, signal.SIGTERM)
-                    return
-            except Exception:
-                pass
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
+from ._process import popen_kwargs_for_new_session, terminate_pid
 
 
 class RadonApp(QtWidgets.QDialog, Ui_Form):
@@ -300,7 +268,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                 cmd,
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                **_popen_kwargs_for_new_session(),
+                **popen_kwargs_for_new_session(),
             )
         print("Radonfit Membrane Analysis started with PID:", self.process.pid)
         self._process_pid = int(self.process.pid)
@@ -315,7 +283,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         else:
             return
 
-        _terminate_pid(pid)
+        terminate_pid(pid)
         print(f"Process PID {pid} terminated")
         self.process = None
         self._process_pid = None
@@ -502,7 +470,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
                 cmd,
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                **_popen_kwargs_for_new_session(),
+                **popen_kwargs_for_new_session(),
             )
         print("Radonfit Membrane Subtraction started with PID:", self.process.pid)
         print(f"Radonfit Membrane Subtraction started using {self.cpu} procs and batch size of {self.batch_size}")
@@ -518,7 +486,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         else:
             return
 
-        _terminate_pid(pid)
+        terminate_pid(pid)
         print(f"Process PID {pid} terminated")
         self.process = None
         self._process_pid = None
@@ -658,7 +626,7 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
                 cmd,
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                **_popen_kwargs_for_new_session(),
+                **popen_kwargs_for_new_session(),
             )
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
         print(f"Micrograph Membrane Subtraction started using {self.cpus} procs and batch size of {self.batch_size}")
@@ -674,7 +642,7 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         else:
             return
 
-        _terminate_pid(pid)
+        terminate_pid(pid)
         print(f"Process PID {pid} terminated")
         self.process = None
         self._process_pid = None

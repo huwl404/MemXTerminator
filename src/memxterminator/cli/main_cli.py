@@ -3,6 +3,7 @@ import sys
 import mrcfile
 
 def _run_gui() -> None:
+    from PyQt5 import QtWidgets
     from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox
 
     from ..GUI.mainwindow_gui import Ui_MainWindow
@@ -24,6 +25,17 @@ def _run_gui() -> None:
             self.micrograph_membrane_subtraction_bezier_pushButton.clicked.connect(
                 self.open_micrograph_membrane_subtraction_bezier
             )
+
+            # Bezierfit: Batch scheduler (job-level parallelism)
+            self.bezier_batch_scheduler_button = QtWidgets.QPushButton(
+                "Batch Scheduler", self.verticalLayoutWidget_2
+            )
+            self.bezier_batch_scheduler_button.setToolTip(
+                "Run multiple Bezierfit jobs in parallel (parameter sweeps and/or multiple datasets).\n\n"
+                "Tip: choose a new empty 'run root' folder per batch run."
+            )
+            self.verticalLayout_2.addWidget(self.bezier_batch_scheduler_button)
+            self.bezier_batch_scheduler_button.clicked.connect(self.open_bezier_batch_scheduler)
 
         def _show_feature_import_error(self, feature_name: str, exc: Exception) -> None:
             QMessageBox.critical(
@@ -150,6 +162,15 @@ def _run_gui() -> None:
                 )
                 self.micrograph_membrane_subtraction_bezier_dialog.show()
 
+        def open_bezier_batch_scheduler(self):
+            try:
+                from .bezierfit_batch_scheduler_gui import BezierfitBatchSchedulerDialog
+            except Exception as exc:
+                self._show_feature_import_error("Bezierfit Batch Scheduler", exc)
+                return
+            self.bezier_batch_scheduler_dialog = BezierfitBatchSchedulerDialog(self)
+            self.bezier_batch_scheduler_dialog.show()
+
     app = QApplication(sys.argv)
     mainWin = MainWindow()
     mainWin.show()
@@ -180,6 +201,15 @@ def main():
     parser_gui = subparsers.add_parser('gui')
     parser_fixmapid = subparsers.add_parser('fixmapid')
     parser_fixmapid.add_argument('file', nargs='+', help='Path to .mrc file(s)')
+    parser_bezier_batch = subparsers.add_parser(
+        'bezierfit-batch',
+        help='Run multiple Bezierfit jobs in parallel from a JSON spec (batch scheduler).',
+    )
+    parser_bezier_batch.add_argument('--spec', required=True, help='Path to batch spec JSON file.')
+    parser_bezier_batch.add_argument('--state', default=None, help='Path to write scheduler_state.json.')
+    parser_bezier_batch.add_argument('--gpus', default=None, help="Override GPU list, e.g. '0,1,2' or 'auto'.")
+    parser_bezier_batch.add_argument('--policy', choices=['fill_first', 'round_robin'], default=None)
+    parser_bezier_batch.add_argument('--max_running_jobs', type=int, default=None)
     args = parser.parse_args()
 
     if args.command is None:
@@ -192,3 +222,17 @@ def main():
     if args.command == 'fixmapid':
         for file_path in args.file:
             fix_mrc_file(file_path)
+
+    if args.command == 'bezierfit-batch':
+        from memxterminator.bezierfit.scheduler.cli import main as scheduler_main
+
+        argv = ['--spec', args.spec]
+        if args.state:
+            argv += ['--state', args.state]
+        if args.gpus:
+            argv += ['--gpus', args.gpus]
+        if args.policy:
+            argv += ['--policy', args.policy]
+        if args.max_running_jobs is not None:
+            argv += ['--max_running_jobs', str(int(args.max_running_jobs))]
+        scheduler_main(argv)
