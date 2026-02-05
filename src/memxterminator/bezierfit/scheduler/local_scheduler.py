@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from memxterminator.mxt_state import write_json_atomic
+from memxterminator.path_resolve import infer_input_base_dir
 
 from .gpu_allocator import GpuAllocator
 from .spec import BezierfitJob, JobResult, JobStatus, JobSpecFile, SchedulerSpec, build_job_argv, now_utc_iso
@@ -93,6 +94,46 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
     write_json_atomic(str(path), state)
 
 
+def _infer_primary_input_path(kind: str, args: dict[str, Any]) -> str | None:
+    """
+    Best-effort pick a "primary" input file path for base-dir inference.
+    """
+    if kind == "bezierfit_particle_pms":
+        p = args.get("particle")
+        return None if p in (None, "") else str(p)
+    if kind == "bezierfit_micrograph_mms":
+        p = args.get("particle")
+        return None if p in (None, "") else str(p)
+    if kind == "bezierfit_mem_analyze":
+        t = args.get("template")
+        if t not in (None, ""):
+            return str(t)
+        p = args.get("particle")
+        return None if p in (None, "") else str(p)
+    return None
+
+
+def _ensure_input_base_dir(kind: str, args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Ensure `args["input_base_dir"]` is set when running under the batch scheduler.
+
+    Rationale:
+    - Scheduler runs each job with `cwd=<job_output_root>` for log isolation.
+    - CryoSPARC `.cs` and STAR files often contain relative paths like `J220/extract/...`.
+    - Setting input_base_dir makes job scripts cwd-independent.
+    """
+    existing = args.get("input_base_dir")
+    if existing not in (None, ""):
+        return args
+
+    primary = _infer_primary_input_path(kind, args)
+    if primary in (None, ""):
+        return args
+
+    args["input_base_dir"] = infer_input_base_dir(primary)
+    return args
+
+
 def run_jobs(
     *,
     spec: SchedulerSpec,
@@ -164,6 +205,8 @@ def run_jobs(
         args = dict(job.args)
         if job.kind in {"bezierfit_particle_pms", "bezierfit_micrograph_mms"} and "procs" not in args:
             args["procs"] = job.resources.procs if job.resources.procs is not None else int(job.resources.gpus)
+
+        args = _ensure_input_base_dir(job.kind, args)
 
         job_resolved = BezierfitJob(
             job_id=job.job_id,

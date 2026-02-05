@@ -21,6 +21,7 @@ from memxterminator.bezierfit.scheduler.spec import (
     parse_gpu_list,
     parse_spec_dict,
 )
+from memxterminator.path_resolve import infer_input_base_dir, normalise_dir
 
 from ._command_preview import CommandPreviewDialog
 from ._deps import check_cupy_cuda_available
@@ -64,6 +65,8 @@ class _GuiJob:
     procs: int | None = None
     output_root: str = ""
     custom_output_root: bool = False
+    input_base_dir: str = ""
+    custom_input_base_dir: bool = False
     args: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     assigned_gpus: list[int] = field(default_factory=list)
@@ -272,11 +275,33 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         out_wrap = QtWidgets.QWidget(panel)
         out_wrap.setLayout(out_row)
 
+        self.customInputBaseDirCheck = QtWidgets.QCheckBox("Custom input base dir", panel)
+        self.customInputBaseDirCheck.setToolTip(
+            "When disabled, input_base_dir is auto-inferred from this job's primary input file.\n"
+            "input_base_dir is used to resolve relative paths embedded inside CryoSPARC .cs / STAR files\n"
+            "(e.g. 'J220/extract/...') when running in batch mode."
+        )
+        self.inputBaseDirEdit = QtWidgets.QLineEdit(panel)
+        self.inputBaseDirEdit.setPlaceholderText("(auto)")
+        self.inputBaseDirEdit.setToolTip(
+            "Base directory used to resolve relative paths stored inside CryoSPARC .cs / STAR files.\n"
+            "If your .cs/.star contains paths like 'J220/extract/...', set this to the CryoSPARC project root."
+        )
+        self.inputBaseDirBrowse = QtWidgets.QPushButton("Browse...", panel)
+        self.inputBaseDirBrowse.clicked.connect(self._browse_input_base_dir)
+
+        base_row = QtWidgets.QHBoxLayout()
+        base_row.addWidget(self.inputBaseDirEdit, stretch=1)
+        base_row.addWidget(self.inputBaseDirBrowse)
+        base_wrap = QtWidgets.QWidget(panel)
+        base_wrap.setLayout(base_row)
+
         form.addRow("Job ID", self.jobIdEdit)
         form.addRow("Kind", self.kindCombo)
         form.addRow("GPUs/job", self.gpusSpin)
         form.addRow("Procs/job", self.procsEdit)
         form.addRow(self.customOutCheck, out_wrap)
+        form.addRow(self.customInputBaseDirCheck, base_wrap)
 
         self.kindStack = QtWidgets.QStackedWidget(panel)
         self.kindStack.addWidget(self._build_page_mem_analyze(panel))
@@ -291,6 +316,8 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self.procsEdit.editingFinished.connect(self._apply_editor_to_selected_job)
         self.customOutCheck.stateChanged.connect(self._on_custom_output_root_changed)
         self.outputRootEdit.editingFinished.connect(self._apply_editor_to_selected_job)
+        self.customInputBaseDirCheck.stateChanged.connect(self._on_custom_input_base_dir_changed)
+        self.inputBaseDirEdit.editingFinished.connect(self._apply_editor_to_selected_job)
 
         return panel
 
@@ -545,8 +572,107 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.customOutCheck.setChecked(True)
             self._apply_editor_to_selected_job()
 
+    def _browse_input_base_dir(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select input base directory")
+        if path:
+            self.customInputBaseDirCheck.setChecked(True)
+            self.inputBaseDirEdit.setText(path)
+            self._apply_editor_to_selected_job()
+
     def _on_custom_output_root_changed(self) -> None:
         self._apply_editor_to_selected_job()
+
+    def _on_custom_input_base_dir_changed(self) -> None:
+        """
+        Toggle between auto-inferred and user-provided `input_base_dir`.
+
+        When enabling custom mode, prefill the field with the current auto
+        inference to make overrides easy and non-empty by default.
+        """
+        if self._selected_row is None:
+            return
+        if not (0 <= self._selected_row < len(self._jobs)):
+            return
+
+        job = self._jobs[self._selected_row]
+        if bool(self.customInputBaseDirCheck.isChecked()) and not self.inputBaseDirEdit.text().strip():
+            inferred = self._auto_infer_input_base_dir(job)
+            if inferred:
+                self.inputBaseDirEdit.setText(inferred)
+
+        self._apply_editor_to_selected_job()
+
+    def _primary_input_path_for_job(self, job: _GuiJob) -> str | None:
+        if job.kind == "bezierfit_particle_pms":
+            p = job.args.get("particle")
+            return None if p in (None, "") else str(p)
+        if job.kind == "bezierfit_micrograph_mms":
+            p = job.args.get("particle")
+            return None if p in (None, "") else str(p)
+        if job.kind == "bezierfit_mem_analyze":
+            t = job.args.get("template")
+            if t not in (None, ""):
+                return str(t)
+            p = job.args.get("particle")
+            return None if p in (None, "") else str(p)
+        return None
+
+    def _normalise_path_for_inference(self, path_str: str) -> str:
+        """
+        Convert `path_str` into a deterministic absolute path for base-dir inference.
+
+        - If absolute: resolve directly.
+        - If relative: resolve relative to run_root (if set), otherwise current cwd.
+        """
+        s = str(path_str).strip()
+        if s == "":
+            return ""
+
+        expanded = os.path.expanduser(os.path.expandvars(s))
+        p = Path(expanded)
+        if p.is_absolute():
+            return str(p.resolve())
+
+        base = Path(self._run_root) if self._run_root else Path(os.getcwd())
+        return str((base / p).resolve())
+
+    def _auto_infer_input_base_dir(self, job: _GuiJob) -> str:
+        primary = self._primary_input_path_for_job(job)
+        if primary is None:
+            return ""
+        try:
+            abs_primary = self._normalise_path_for_inference(primary)
+            if abs_primary == "":
+                return ""
+            return infer_input_base_dir(abs_primary)
+        except Exception:
+            return ""
+
+    def _resolved_input_base_dir(self, job: _GuiJob) -> str:
+        """
+        Determine the `input_base_dir` that should be written to the spec.
+        """
+        if bool(job.custom_input_base_dir) and str(job.input_base_dir).strip():
+            return str(job.input_base_dir).strip()
+        return self._auto_infer_input_base_dir(job)
+
+    def _sync_input_base_dir_widgets(self, job: _GuiJob, *, set_checkbox: bool = True) -> None:
+        """
+        Update the input_base_dir UI controls for the given job.
+        """
+        custom = bool(job.custom_input_base_dir)
+        if set_checkbox:
+            self.customInputBaseDirCheck.setChecked(custom)
+
+        if custom:
+            self.inputBaseDirEdit.setEnabled(True)
+            self.inputBaseDirBrowse.setEnabled(True)
+            self.inputBaseDirEdit.setText(str(job.input_base_dir or ""))
+        else:
+            inferred = self._auto_infer_input_base_dir(job)
+            self.inputBaseDirEdit.setEnabled(False)
+            self.inputBaseDirBrowse.setEnabled(False)
+            self.inputBaseDirEdit.setText(inferred)
 
     def _auto_detect_gpus(self) -> None:
         ok, details = check_cupy_cuda_available()
@@ -695,6 +821,8 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.mmsSkipFailedCheck.setChecked(bool(job.args.get("skip_failed", False)))
             self.mmsRequireParticleMxtCheck.setChecked(bool(job.args.get("require_particle_mxt", True)))
 
+        self._sync_input_base_dir_widgets(job, set_checkbox=True)
+
     def _apply_editor_to_selected_job(self) -> None:
         if self._selected_row is None:
             return
@@ -715,6 +843,20 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             if self._run_root:
                 job.output_root = str(Path(self._run_root) / job.job_id)
             self.outputRootEdit.setText(job.output_root)
+
+        job.custom_input_base_dir = bool(self.customInputBaseDirCheck.isChecked())
+        if job.custom_input_base_dir:
+            raw_base = self.inputBaseDirEdit.text().strip()
+            if raw_base:
+                try:
+                    job.input_base_dir = normalise_dir(raw_base)
+                except Exception:
+                    # Keep the raw text; spec export will fall back to auto if empty.
+                    job.input_base_dir = raw_base
+            else:
+                job.input_base_dir = ""
+        else:
+            job.input_base_dir = ""
 
         # Kind-specific args
         if job.kind == "bezierfit_mem_analyze":
@@ -758,6 +900,9 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
 
         self.outputRootEdit.setEnabled(bool(job.custom_output_root))
         self.outputRootBrowse.setEnabled(bool(job.custom_output_root))
+        if job.custom_input_base_dir and str(job.input_base_dir).strip():
+            self.inputBaseDirEdit.setText(str(job.input_base_dir))
+        self._sync_input_base_dir_widgets(job, set_checkbox=False)
 
         self._refresh_table(select_row=self._selected_row)
 
@@ -818,6 +963,8 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             procs=base.procs,
             output_root=out_root,
             custom_output_root=False,
+            input_base_dir=str(base.input_base_dir),
+            custom_input_base_dir=bool(base.custom_input_base_dir),
             args=dict(base.args),
         )
         self._jobs.insert(self._selected_row + 1, clone)
@@ -864,6 +1011,8 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     procs=base.procs,
                     output_root=out_root,
                     custom_output_root=False,
+                    input_base_dir=str(base.input_base_dir),
+                    custom_input_base_dir=bool(base.custom_input_base_dir),
                     args=new_args,
                 )
             )
@@ -885,6 +1034,9 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
 
         self._jobs = []
         for j in spec.jobs:
+            imported_args = dict(j.args)
+            imported_base = str(imported_args.pop("input_base_dir", "") or "")
+            imported_base = imported_base.strip()
             self._jobs.append(
                 _GuiJob(
                     enabled=bool(j.enabled),
@@ -894,7 +1046,9 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     procs=j.resources.procs,
                     output_root=str(j.output_root),
                     custom_output_root=True,
-                    args=dict(j.args),
+                    input_base_dir=imported_base,
+                    custom_input_base_dir=bool(imported_base),
+                    args=imported_args,
                     status="queued",
                 )
             )
@@ -950,6 +1104,11 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             if not job.enabled:
                 continue
 
+            args = dict(job.args)
+            resolved_base = self._resolved_input_base_dir(job)
+            if resolved_base:
+                args["input_base_dir"] = resolved_base
+
             jobs.append(
                 {
                     "job_id": job.job_id,
@@ -957,7 +1116,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     "enabled": True,
                     "output_root": job.output_root,
                     "resources": {"gpus": int(job.gpus), "procs": job.procs},
-                    "args": dict(job.args),
+                    "args": args,
                 }
             )
 
@@ -1060,6 +1219,9 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             args = dict(job.args)
             if job.kind in {"bezierfit_particle_pms", "bezierfit_micrograph_mms"} and "procs" not in args:
                 args["procs"] = job.procs if job.procs is not None else int(job.gpus)
+            resolved_base = self._resolved_input_base_dir(job)
+            if resolved_base:
+                args["input_base_dir"] = resolved_base
             bjob = BezierfitJob(
                 job_id=job.job_id,
                 kind=job.kind,  # type: ignore[arg-type]

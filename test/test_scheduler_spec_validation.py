@@ -21,6 +21,7 @@ def main() -> None:
                     "particle": "/data/particles_selected.cs",
                     "template": "/data/templates_selected.cs",
                     "control_points": "/data/control_points.json",
+                    "input_base_dir": "cryosparc_project_root",
                     "points_step": 0.005,
                     "physical_membrane_dist": 35,
                     "resume": True,
@@ -37,6 +38,7 @@ def main() -> None:
     assert len(parsed.jobs) == 1
     assert Path(parsed.jobs[0].output_root).is_absolute()
     assert str(tmp / "runs" / "pms_a") == parsed.jobs[0].output_root
+    assert parsed.jobs[0].args["input_base_dir"] == str((tmp / "cryosparc_project_root").resolve())
 
     # parse_gpu_list
     assert parse_gpu_list("0,1,2") == [0, 1, 2]
@@ -108,4 +110,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

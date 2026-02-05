@@ -29,6 +29,7 @@ from memxterminator.mxt_state import (
     write_json_atomic,
     write_mrc_atomic,
 )
+from memxterminator.path_resolve import infer_input_base_dir, normalise_dir, resolve_path
 
 _WORKER_RUNNER = None
 _EVENT_LOG_PATH: str | None = None
@@ -139,6 +140,7 @@ class MicrographMembraneSubtract:
         self,
         particles_selected_filename: str,
         *,
+        input_base_dir: str | None = None,
         resume: bool = True,
         force: bool = False,
         adopt_existing_outputs: bool = False,
@@ -148,6 +150,11 @@ class MicrographMembraneSubtract:
         output_root: str | None = None,
     ):
         self.particles_selected_filename = particles_selected_filename
+
+        if input_base_dir is not None and str(input_base_dir).strip() != "":
+            self.input_base_dir = normalise_dir(input_base_dir)
+        else:
+            self.input_base_dir = infer_input_base_dir(self.particles_selected_filename)
 
         self.resume = bool(resume)
         self.force = bool(force)
@@ -180,11 +187,30 @@ class MicrographMembraneSubtract:
 
         parsed = [parse_relion_image_name_1based(x) for x in self.df_star["rlnImageName"].tolist()]
         self.df_star = self.df_star.copy()
-        self.df_star["_memx_stack_path"] = [p for p, _ in parsed]
+        self.df_star["_memx_stack_path"] = [resolve_path(p, base_dir=self.input_base_dir) for p, _ in parsed]
         self.df_star["_memx_section_1based"] = [i for _, i in parsed]
 
         self.rawimage_stacks_name_lst = self.get_rawimage_stacks_name_lst()
         self.raw_mg_name_lst = self.get_raw_stack_micrograph_pairs()
+
+        # Fail-fast when the base dir is clearly wrong (common batch misconfiguration).
+        if self.rawimage_stacks_name_lst and not any(os.path.exists(p) for p in self.rawimage_stacks_name_lst):
+            raise SystemExit(
+                "ERROR: None of the particle stacks referenced in the STAR file could be found on disk.\n"
+                f"  particles_selected_filename: {self.particles_selected_filename}\n"
+                f"  inferred input_base_dir: {self.input_base_dir}\n"
+                "This usually means the STAR contains relative paths (e.g. 'J220/extract/...') and the base directory is wrong.\n\n"
+                "Fix: re-run with an explicit base directory, for example:\n"
+                "  --input_base_dir /path/to/cryosparc_project_root\n"
+            )
+        if self.raw_mg_name_lst and not any(os.path.exists(mg) for _stack, mg in self.raw_mg_name_lst):
+            raise SystemExit(
+                "ERROR: None of the micrographs referenced in the STAR file could be found on disk.\n"
+                f"  particles_selected_filename: {self.particles_selected_filename}\n"
+                f"  inferred input_base_dir: {self.input_base_dir}\n"
+                "Fix: re-run with an explicit base directory, for example:\n"
+                "  --input_base_dir /path/to/cryosparc_project_root\n"
+            )
 
         self.rawimage_size: int | None = None
         self.weights = None
@@ -206,7 +232,10 @@ class MicrographMembraneSubtract:
                 raise ValueError(
                     f"Expected exactly 1 micrograph per particle stack, got {len(micrographs)} for {stack_path}: {micrographs[:3]}"
                 )
-            pairs.append((stack_path, micrographs[0]))
+            mg = str(micrographs[0]).strip()
+            if mg == "":
+                raise ValueError(f"Empty rlnMicrographName for stack: {stack_path}")
+            pairs.append((stack_path, resolve_path(mg, base_dir=self.input_base_dir)))
         return pairs
 
     def get_df_temp(self, rawimage_stacks_name):
@@ -698,10 +727,12 @@ class MicrographMembraneSubtract:
                 yield lst[i : i + n]
 
         print(">>> Preparing Micrograph Membrane Subtraction dataset...")
+        print(f">>> input_base_dir: {self.input_base_dir}")
         print(f">>> Found {len(self.raw_mg_name_lst)} raw micrographs in total.")
 
         worker_config = {
             "particles_selected_filename": self.particles_selected_filename,
+            "input_base_dir": self.input_base_dir,
             "resume": bool(self.resume),
             "force": bool(self.force),
             "adopt_existing_outputs": bool(self.adopt_existing_outputs),
@@ -740,6 +771,16 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument('--batch_size', type=int, default=30)
+    parser.add_argument(
+        "--input_base_dir",
+        type=str,
+        default=None,
+        help=(
+            "Base directory used to resolve relative paths stored inside STAR files "
+            "(e.g. 'J220/extract/...'). If omitted, auto-infer from the STAR path "
+            "(CryoSPARC layout aware)."
+        ),
+    )
     parser.add_argument(
         "--output_root",
         type=str,
@@ -787,6 +828,7 @@ if __name__ == '__main__':
 
     mms = MicrographMembraneSubtract(
         args.particles_selected_filename,
+        input_base_dir=args.input_base_dir,
         resume=args.resume,
         force=args.force,
         adopt_existing_outputs=args.adopt_existing_outputs,

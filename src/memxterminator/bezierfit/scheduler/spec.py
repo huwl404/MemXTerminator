@@ -181,7 +181,7 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
             raise ValueError(f"Unsupported job kind {kind!r} for job_id={job_id!r}")
 
         args_raw = _require_mapping(j_map.get("args", {}), where=f"spec.jobs[{i}].args")
-        args = dict(args_raw)
+        args = _normalise_job_args_paths(kind=kind, args=dict(args_raw), base_dir=base_dir)
 
         output_root_raw = j_map.get("output_root")
         if output_root_raw is None:
@@ -217,6 +217,42 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
         raise ValueError(f"Duplicate job_id values found: {ids}")
 
     return JobSpecFile(scheduler=scheduler, jobs=jobs)
+
+
+def _normalise_job_args_paths(*, kind: str, args: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    """
+    Normalize known path-like job args relative to `base_dir` (spec directory).
+
+    This prevents surprises when the scheduler changes `cwd` to the per-job
+    output directory, which would otherwise break relative input paths.
+    """
+    keys: set[str]
+    if kind == "bezierfit_particle_pms":
+        keys = {"particle", "template", "control_points", "input_base_dir"}
+    elif kind == "bezierfit_micrograph_mms":
+        keys = {"particle", "input_base_dir"}
+    elif kind == "bezierfit_mem_analyze":
+        # Note: `output` is intentionally not normalized so relative outputs
+        # remain relative to the job's `cwd` (job output_root) under the scheduler.
+        keys = {"template", "particle", "input_base_dir"}
+    else:  # pragma: no cover
+        keys = set()
+
+    for k in keys:
+        v = args.get(k)
+        if not isinstance(v, str):
+            continue
+        raw = v.strip()
+        if raw == "":
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(raw))
+        p = Path(expanded)
+        if p.is_absolute():
+            args[k] = str(p)
+            continue
+        args[k] = str((base_dir / p).resolve())
+
+    return args
 
 
 def _validate_job_args(*, kind: str, args: dict[str, Any], job_id: str) -> None:

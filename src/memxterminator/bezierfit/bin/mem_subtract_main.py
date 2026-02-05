@@ -26,6 +26,7 @@ from memxterminator.mxt_state import (
     write_json_atomic,
     write_mrc_atomic,
 )
+from memxterminator.path_resolve import infer_input_base_dir, normalise_dir, resolve_path
 
 
 _WORKER_RUNNER = None
@@ -136,6 +137,7 @@ class BezierfitParticleMembraneSubtract:
         control_points_json: str,
         points_step: float,
         physical_membrane_dist: int,
+        input_base_dir: str | None = None,
         resume: bool = True,
         force: bool = False,
         adopt_existing_outputs: bool = False,
@@ -153,6 +155,11 @@ class BezierfitParticleMembraneSubtract:
         self.skip_failed = bool(skip_failed)
         self.strict_output_check = bool(strict_output_check)
         self.output_root = output_root
+
+        if input_base_dir is not None and str(input_base_dir).strip() != "":
+            self.input_base_dir = normalise_dir(input_base_dir)
+        else:
+            self.input_base_dir = infer_input_base_dir(self.particle_cs)
 
         self.mxt_task = "bezierfit_particle_pms"
         self.mxt_params = {
@@ -185,8 +192,38 @@ class BezierfitParticleMembraneSubtract:
         with open(self.control_points_json, "r", encoding="utf-8") as f:
             self._control_points_dict = json.load(f)
 
-        unique_stacks = _remove_duplicates_preserve_order(self._particle_filenames.tolist())
+        raw_stacks = [str(x) for x in self._particle_filenames.tolist()]
+        if not raw_stacks:
+            raise ValueError(f"No particle stacks found in CryoSPARC dataset: {self.particle_cs!r} (blob/path is empty)")
+
+        resolved_stacks: list[str] = []
+        for raw in raw_stacks:
+            raw_s = str(raw).strip()
+            if raw_s == "":
+                raise ValueError(f"Empty stack path found in CryoSPARC dataset: {self.particle_cs!r} (blob/path contains empty)")
+            resolved_stacks.append(resolve_path(raw_s, base_dir=self.input_base_dir))
+
+        # Keep a resolved, row-aligned copy for correct per-stack masking.
+        self._particle_filenames_resolved = np.asarray(resolved_stacks).astype(str)
+
+        unique_stacks = _remove_duplicates_preserve_order(resolved_stacks)
         self.particle_stack_paths = unique_stacks
+
+        # Fail-fast on common misconfiguration: wrong base directory causing all relative paths to break.
+        sample_n = min(3, len(self.particle_stack_paths))
+        sample = self.particle_stack_paths[:sample_n]
+        missing = [p for p in sample if not os.path.exists(p)]
+        if missing:
+            raise SystemExit(
+                "ERROR: Cannot find particle stack file(s) referenced in CryoSPARC .cs.\n"
+                f"  particle_cs: {self.particle_cs}\n"
+                f"  inferred input_base_dir: {self.input_base_dir}\n"
+                f"  example missing resolved path: {missing[0]}\n"
+                "This usually means the paths stored inside the .cs file are relative (e.g. 'J220/extract/...')\n"
+                "but the current working directory is not the CryoSPARC project root.\n\n"
+                "Fix: re-run with an explicit base directory, for example:\n"
+                "  --input_base_dir /path/to/cryosparc_project_root\n"
+            )
 
     def _output_passes_sanity_check(self, out_stack: str) -> bool:
         """
@@ -356,7 +393,7 @@ class BezierfitParticleMembraneSubtract:
                 particle_stack = cp.asarray(mrc.data)
 
             subtracted_particle_stack = particle_stack.copy()
-            mask = self._particle_filenames == raw_stack
+            mask = self._particle_filenames_resolved == raw_stack
             particle_idxes = self._particle_idx[mask]
             psis = self._psi[mask]
             pixel_sizes = self._pixel_size[mask]
@@ -497,6 +534,16 @@ def main() -> None:
     parser.add_argument("--points_step", type=float, default=0.005)
     parser.add_argument("--physical_membrane_dist", type=int, default=35)
     parser.add_argument(
+        "--input_base_dir",
+        type=str,
+        default=None,
+        help=(
+            "Base directory used to resolve relative paths stored inside CryoSPARC .cs files "
+            "(e.g. 'J220/extract/...'). If omitted, auto-infer from the particle .cs path "
+            "(CryoSPARC layout aware)."
+        ),
+    )
+    parser.add_argument(
         "--output_root",
         type=str,
         default=None,
@@ -559,6 +606,7 @@ def main() -> None:
         control_points_json=args.control_points,
         points_step=args.points_step,
         physical_membrane_dist=args.physical_membrane_dist,
+        input_base_dir=args.input_base_dir,
         resume=args.resume,
         force=args.force,
         adopt_existing_outputs=args.adopt_existing_outputs,
@@ -567,6 +615,7 @@ def main() -> None:
     )
 
     print(">>> Preparing Bezierfit Particle Membrane Subtraction dataset...")
+    print(f">>> input_base_dir: {runner.input_base_dir}")
     print(f">>> Found {len(runner.particle_stack_paths)} raw particle stacks in total.")
     procs = int(args.procs)
     if procs <= 0:
@@ -599,6 +648,7 @@ def main() -> None:
         "control_points_json": args.control_points,
         "points_step": float(args.points_step),
         "physical_membrane_dist": int(args.physical_membrane_dist),
+        "input_base_dir": runner.input_base_dir,
         "resume": bool(args.resume),
         "force": bool(args.force),
         "adopt_existing_outputs": bool(args.adopt_existing_outputs),
