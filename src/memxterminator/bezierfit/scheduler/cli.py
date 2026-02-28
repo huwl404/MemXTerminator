@@ -71,7 +71,15 @@ def main(argv: list[str] | None = None) -> None:
     if not spec_path.exists():
         raise SystemExit(f"Spec file not found: {spec_path}")
 
-    job_spec: JobSpecFile = load_spec_file(spec_path)
+    try:
+        job_spec: JobSpecFile = load_spec_file(spec_path)
+    except Exception as exc:
+        print(
+            f"ERROR: Scheduler spec validation failed for {spec_path}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2)
 
     gpus_override: list[int] | None = None
     if args.gpus is not None:
@@ -103,4 +111,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -4,10 +4,13 @@ import json
 import os
 import re
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
+
+from memxterminator.mxt_state import validate_output_dirname
 
 JobKind = Literal[
     "bezierfit_mem_analyze",
@@ -36,6 +39,7 @@ class BezierfitJob:
     output_root: str
     resources: JobResources
     enabled: bool = True
+    depends_on: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,7 @@ class SchedulerSpec:
 class JobSpecFile:
     scheduler: SchedulerSpec
     jobs: list[BezierfitJob]
+    spec_schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,12 @@ def load_spec_file(path: os.PathLike[str] | str) -> JobSpecFile:
 
 def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
     root = _require_mapping(obj, where="spec")
+    if "spec_schema_version" in root:
+        spec_schema_version = _require_int(root.get("spec_schema_version"), where="spec.spec_schema_version")
+    else:
+        spec_schema_version = 1
+    if spec_schema_version < 1:
+        raise ValueError(f"spec.spec_schema_version must be >= 1, got {spec_schema_version}")
     scheduler_raw = _require_mapping(root.get("scheduler"), where="spec.scheduler")
 
     policy = str(scheduler_raw.get("policy", "fill_first")).strip()
@@ -182,6 +193,8 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
 
         args_raw = _require_mapping(j_map.get("args", {}), where=f"spec.jobs[{i}].args")
         args = _normalise_job_args_paths(kind=kind, args=dict(args_raw), base_dir=base_dir)
+        if kind in {"bezierfit_particle_pms", "bezierfit_micrograph_mms"} and "output_dirname" in args:
+            args["output_dirname"] = validate_output_dirname(_require_str(args.get("output_dirname"), where=f"spec.jobs[{i}].args.output_dirname"))
 
         output_root_raw = j_map.get("output_root")
         if output_root_raw is None:
@@ -198,6 +211,20 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
         procs_val = resources_raw.get("procs", None)
         procs = None if procs_val is None else _require_int(procs_val, where=f"spec.jobs[{i}].resources.procs")
 
+        depends_raw = j_map.get("depends_on", [])
+        if depends_raw is None:
+            depends_raw = []
+        if not isinstance(depends_raw, list):
+            raise ValueError(f"spec.jobs[{i}].depends_on must be a list[str], got {type(depends_raw).__name__}")
+        depends_on: list[str] = []
+        for dep_i, dep in enumerate(depends_raw):
+            dep_id = parse_job_id(dep)
+            if dep_id in depends_on:
+                raise ValueError(
+                    f"Duplicate dependency id {dep_id!r} in spec.jobs[{i}].depends_on[{dep_i}] for job_id={job_id!r}"
+                )
+            depends_on.append(dep_id)
+
         _validate_job_args(kind=kind, args=args, job_id=job_id)
 
         jobs.append(
@@ -208,6 +235,7 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
                 output_root=str(output_root_path),
                 resources=JobResources(gpus=gpus_per_job, procs=procs),
                 enabled=bool(enabled),
+                depends_on=tuple(depends_on),
             )
         )
 
@@ -216,7 +244,9 @@ def parse_spec_dict(obj: Any, *, base_dir: Path) -> JobSpecFile:
     if len(set(ids)) != len(ids):
         raise ValueError(f"Duplicate job_id values found: {ids}")
 
-    return JobSpecFile(scheduler=scheduler, jobs=jobs)
+    jobs = _validate_and_inject_dependencies(jobs=jobs)
+
+    return JobSpecFile(scheduler=scheduler, jobs=jobs, spec_schema_version=int(spec_schema_version))
 
 
 def _normalise_job_args_paths(*, kind: str, args: dict[str, Any], base_dir: Path) -> dict[str, Any]:
@@ -230,7 +260,7 @@ def _normalise_job_args_paths(*, kind: str, args: dict[str, Any], base_dir: Path
     if kind == "bezierfit_particle_pms":
         keys = {"particle", "template", "control_points", "input_base_dir"}
     elif kind == "bezierfit_micrograph_mms":
-        keys = {"particle", "input_base_dir"}
+        keys = {"particle", "input_base_dir", "particle_output_root"}
     elif kind == "bezierfit_mem_analyze":
         # Note: `output` is intentionally not normalized so relative outputs
         # remain relative to the job's `cwd` (job output_root) under the scheduler.
@@ -266,10 +296,26 @@ def _validate_job_args(*, kind: str, args: dict[str, Any], job_id: str) -> None:
         require("control_points")
         require("points_step")
         require("physical_membrane_dist")
+        if "output_dirname" in args and _value_is_nonempty(args.get("output_dirname")):
+            args["output_dirname"] = validate_output_dirname(_require_str(args.get("output_dirname"), where=f"job[{job_id}].args.output_dirname"))
+        for key in {"resume"}:
+            if key in args:
+                _require_bool(args.get(key), where=f"job[{job_id}].args.{key}")
+        for key in {"force", "adopt_existing_outputs", "skip_failed"}:
+            if key in args:
+                _require_bool(args.get(key), where=f"job[{job_id}].args.{key}")
         return
 
     if kind == "bezierfit_micrograph_mms":
         require("particle")
+        if "output_dirname" in args and _value_is_nonempty(args.get("output_dirname")):
+            args["output_dirname"] = validate_output_dirname(_require_str(args.get("output_dirname"), where=f"job[{job_id}].args.output_dirname"))
+        for key in {"resume", "require_particle_mxt", "strict_dependencies", "write_output_star"}:
+            if key in args:
+                _require_bool(args.get(key), where=f"job[{job_id}].args.{key}")
+        for key in {"force", "adopt_existing_outputs", "skip_failed"}:
+            if key in args:
+                _require_bool(args.get(key), where=f"job[{job_id}].args.{key}")
         return
 
     if kind == "bezierfit_mem_analyze":
@@ -279,6 +325,216 @@ def _validate_job_args(*, kind: str, args: dict[str, Any], job_id: str) -> None:
         return
 
     raise ValueError(f"Unexpected kind {kind!r}")
+
+
+def _value_is_nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip() != ""
+
+
+def _require_bool_with_default(args: Mapping[str, Any], *, key: str, default: bool, where: str) -> bool:
+    if key not in args:
+        return bool(default)
+    return _require_bool(args.get(key), where=where)
+
+
+def _validate_dependency_graph_acyclic(jobs: list[BezierfitJob]) -> None:
+    by_id = {job.job_id: job for job in jobs}
+    indegree: dict[str, int] = {job.job_id: 0 for job in jobs}
+    edges: dict[str, list[str]] = {job.job_id: [] for job in jobs}
+
+    for job in jobs:
+        for dep_id in job.depends_on:
+            # Unknown dependency IDs are validated earlier.
+            if dep_id not in by_id:  # pragma: no cover
+                continue
+            edges[dep_id].append(job.job_id)
+            indegree[job.job_id] += 1
+
+    q: deque[str] = deque([job_id for job_id, deg in indegree.items() if deg == 0])
+    visited: list[str] = []
+    while q:
+        node = q.popleft()
+        visited.append(node)
+        for nxt in edges.get(node, []):
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                q.append(nxt)
+
+    if len(visited) != len(jobs):
+        cycle_nodes = sorted([job_id for job_id, deg in indegree.items() if deg > 0])
+        raise ValueError(
+            "Dependency cycle detected in spec.jobs[].depends_on.\n"
+            f"  cycle_nodes={cycle_nodes}"
+        )
+
+
+def _validate_and_inject_dependencies(*, jobs: list[BezierfitJob]) -> list[BezierfitJob]:
+    by_id = {job.job_id: job for job in jobs}
+    args_by_id: dict[str, dict[str, Any]] = {job.job_id: dict(job.args) for job in jobs}
+
+    # Validation order matters for clear diagnostics:
+    # (1) unknown IDs, (2) kind constraints, (3) cycle detection.
+    for job in jobs:
+        for dep_id in job.depends_on:
+            if dep_id not in by_id:
+                raise ValueError(
+                    f"Unknown dependency job_id={dep_id!r} in depends_on for job_id={job.job_id!r}. "
+                    "Fix the ID or remove it."
+                )
+
+    for job in jobs:
+        if not job.depends_on:
+            continue
+        if job.kind != "bezierfit_micrograph_mms":
+            raise ValueError(
+                f"Only bezierfit_micrograph_mms jobs may declare depends_on; "
+                f"job_id={job.job_id!r} kind={job.kind!r} must use depends_on=[]."
+            )
+        for dep_id in job.depends_on:
+            dep_job = by_id[dep_id]
+            if dep_job.kind != "bezierfit_particle_pms":
+                raise ValueError(
+                    f"MMS job_id={job.job_id!r} can only depend on PMS jobs, "
+                    f"but dependency {dep_id!r} has kind={dep_job.kind!r}."
+                )
+        if bool(job.enabled):
+            for dep_id in job.depends_on:
+                dep_job = by_id[dep_id]
+                if not bool(dep_job.enabled):
+                    raise ValueError(
+                        f"Enabled MMS job_id={job.job_id!r} depends on disabled dependency "
+                        f"job_id={dep_id!r}. Enable the dependency or remove depends_on."
+                    )
+
+    _validate_dependency_graph_acyclic(jobs)
+
+    # MMS dependency-root and output_dirname injection / consistency checks.
+    for job in jobs:
+        if job.kind != "bezierfit_micrograph_mms":
+            continue
+        mms_args = args_by_id[job.job_id]
+        explicit_particle_root = _value_is_nonempty(mms_args.get("particle_output_root"))
+        dep_count = len(job.depends_on)
+
+        if dep_count == 0:
+            # Legacy standalone MMS behavior.
+            continue
+
+        if dep_count > 1 and not explicit_particle_root:
+            raise ValueError(
+                f"Ambiguous MMS dependencies for job_id={job.job_id!r}: depends_on has multiple PMS jobs "
+                f"{list(job.depends_on)} but args.particle_output_root is not set."
+            )
+
+        if dep_count == 1:
+            upstream = by_id[job.depends_on[0]]
+            upstream_args = args_by_id[upstream.job_id]
+            upstream_output_dirname = validate_output_dirname(
+                _require_str(
+                    upstream_args.get("output_dirname", "subtracted"),
+                    where=f"spec.jobs[{upstream.job_id}].args.output_dirname",
+                )
+            )
+
+            if not explicit_particle_root:
+                mms_args["particle_output_root"] = upstream.output_root
+
+            if _value_is_nonempty(mms_args.get("output_dirname")):
+                mms_output_dirname = validate_output_dirname(
+                    _require_str(
+                        mms_args.get("output_dirname"),
+                        where=f"spec.jobs[{job.job_id}].args.output_dirname",
+                    )
+                )
+                if mms_output_dirname != upstream_output_dirname:
+                    raise ValueError(
+                        f"MMS job_id={job.job_id!r} output_dirname={mms_output_dirname!r} does not match "
+                        f"upstream PMS job_id={upstream.job_id!r} output_dirname={upstream_output_dirname!r}. "
+                        "Use the same output_dirname to keep dependency lookup consistent."
+                    )
+                mms_args["output_dirname"] = mms_output_dirname
+            else:
+                mms_args["output_dirname"] = upstream_output_dirname
+
+    enabled_jobs = [job for job in jobs if bool(job.enabled)]
+    has_enabled_pms = any(job.kind == "bezierfit_particle_pms" for job in enabled_jobs)
+    has_enabled_mms = any(job.kind == "bezierfit_micrograph_mms" for job in enabled_jobs)
+    if not (has_enabled_pms and has_enabled_mms):
+        resolved_jobs: list[BezierfitJob] = []
+        for job in jobs:
+            resolved_jobs.append(
+                BezierfitJob(
+                    job_id=job.job_id,
+                    kind=job.kind,
+                    args=dict(args_by_id[job.job_id]),
+                    output_root=job.output_root,
+                    resources=job.resources,
+                    enabled=job.enabled,
+                    depends_on=job.depends_on,
+                )
+            )
+        return resolved_jobs
+
+    migration_hint = (
+        "Migration required for PMS+MMS specs: each MMS job must either set depends_on to exactly one PMS job "
+        "or set args.particle_output_root explicitly; and must keep args.require_particle_mxt=true plus "
+        "args.strict_dependencies=true."
+    )
+
+    for job in enabled_jobs:
+        if job.kind != "bezierfit_micrograph_mms":
+            continue
+
+        mms_args = args_by_id[job.job_id]
+        explicit_particle_root = _value_is_nonempty(mms_args.get("particle_output_root"))
+        dep_ok = len(job.depends_on) == 1 and by_id[job.depends_on[0]].kind == "bezierfit_particle_pms"
+        if not (dep_ok or explicit_particle_root):
+            raise ValueError(
+                f"{migration_hint}\n"
+                f"  offending_job={job.job_id!r} depends_on={list(job.depends_on)} "
+                f"particle_output_root={mms_args.get('particle_output_root')!r}"
+            )
+
+        require_particle_mxt = _require_bool_with_default(
+            mms_args,
+            key="require_particle_mxt",
+            default=True,
+            where=f"spec.jobs[{job.job_id}].args.require_particle_mxt",
+        )
+        if require_particle_mxt is not True:
+            raise ValueError(
+                f"{migration_hint}\n"
+                f"  offending_job={job.job_id!r} has require_particle_mxt={require_particle_mxt!r}"
+            )
+
+        strict_dependencies = _require_bool_with_default(
+            mms_args,
+            key="strict_dependencies",
+            default=True,
+            where=f"spec.jobs[{job.job_id}].args.strict_dependencies",
+        )
+        if strict_dependencies is not True:
+            raise ValueError(
+                f"{migration_hint}\n"
+                f"  offending_job={job.job_id!r} has strict_dependencies={strict_dependencies!r}"
+            )
+
+    resolved_jobs: list[BezierfitJob] = []
+    for job in jobs:
+        resolved_jobs.append(
+            BezierfitJob(
+                job_id=job.job_id,
+                kind=job.kind,
+                args=dict(args_by_id[job.job_id]),
+                output_root=job.output_root,
+                resources=job.resources,
+                enabled=job.enabled,
+                depends_on=job.depends_on,
+            )
+        )
+    return resolved_jobs
 
 
 def build_job_argv(job: BezierfitJob) -> list[str]:
@@ -326,7 +582,7 @@ def _args_dict_to_argv(args: dict[str, Any], *, kind: JobKind) -> list[str]:
         bool_optional = {"resume"}
         store_true = {"force", "adopt_existing_outputs", "skip_failed"}
     elif kind == "bezierfit_micrograph_mms":
-        bool_optional = {"resume", "require_particle_mxt"}
+        bool_optional = {"resume", "require_particle_mxt", "strict_dependencies", "write_output_star"}
         store_true = {"force", "adopt_existing_outputs", "skip_failed"}
     elif kind == "bezierfit_mem_analyze":
         bool_optional = set()

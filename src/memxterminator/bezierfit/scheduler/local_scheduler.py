@@ -79,12 +79,14 @@ def _job_state_record(job: BezierfitJob) -> dict[str, Any]:
         "enabled": bool(job.enabled),
         "output_root": out_root,
         "resources": asdict(job.resources),
+        "depends_on": list(job.depends_on),
         "status": "queued",
         "assigned_gpus": [],
         "pid": None,
         "returncode": None,
         "started_utc": None,
         "finished_utc": None,
+        "reason": None,
         "stdout_path": stdout_path,
         "stderr_path": stderr_path,
     }
@@ -162,7 +164,8 @@ def run_jobs(
 
     allocator = GpuAllocator(list(spec.gpus), policy=spec.policy)
 
-    pending = [j for j in jobs if bool(j.enabled)]
+    job_by_id: dict[str, BezierfitJob] = {j.job_id: j for j in jobs}
+    pending: list[BezierfitJob] = [j for j in jobs if bool(j.enabled)]
     results: dict[str, JobResult] = {}
     running: dict[str, _RunningJob] = {}
 
@@ -215,6 +218,7 @@ def run_jobs(
             output_root=str(out_root),
             resources=job.resources,
             enabled=job.enabled,
+            depends_on=job.depends_on,
         )
         argv = build_job_argv(job_resolved)
 
@@ -232,6 +236,7 @@ def run_jobs(
                 "kind": job.kind,
                 "output_root": str(out_root),
                 "resources": asdict(job.resources),
+                "depends_on": list(job.depends_on),
                 "assigned_gpus": allocated_gpus,
                 "argv": argv,
                 "args": args,
@@ -277,7 +282,65 @@ def run_jobs(
         except Exception:
             pass
 
-    def terminate_all(reason_status: JobStatus) -> None:
+    def _job_status(job_id: str) -> str:
+        rec = job_state_by_id.get(job_id)
+        if rec is None:
+            return "unknown"
+        return str(rec.get("status", "unknown"))
+
+    def _is_job_runnable(job: BezierfitJob) -> bool:
+        return all(_job_status(dep_id) == "success" for dep_id in job.depends_on)
+
+    def _has_transitive_non_success_dependency(job_id: str) -> bool:
+        stack = list(job_by_id[job_id].depends_on)
+        seen: set[str] = set()
+        while stack:
+            dep_id = stack.pop()
+            if dep_id in seen:
+                continue
+            seen.add(dep_id)
+            dep_status = _job_status(dep_id)
+            if dep_status != "success":
+                return True
+            dep_job = job_by_id.get(dep_id)
+            if dep_job is None:
+                return True
+            stack.extend(dep_job.depends_on)
+        return False
+
+    def _cancel_pending_jobs(*, reason_for_job: Any) -> None:
+        nonlocal pending
+        now = now_utc_iso()
+        for job in list(pending):
+            reason = str(reason_for_job(job))
+            update_job_state(
+                job.job_id,
+                status="canceled",
+                finished_utc=now,
+                returncode=None,
+                reason=reason,
+            )
+            stdout_path = str(Path(job.output_root) / "scheduler_stdout.log")
+            stderr_path = str(Path(job.output_root) / "scheduler_stderr.log")
+            finalize_job_result(
+                job.job_id,
+                JobResult(
+                    job_id=job.job_id,
+                    status="canceled",
+                    returncode=None,
+                    gpu_ids=[],
+                    output_root=job.output_root,
+                    pid=None,
+                    started_utc=now,
+                    finished_utc=now,
+                    cmd_argv=build_job_argv(job),
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                ),
+            )
+        pending = []
+
+    def terminate_all(reason_status: JobStatus, *, reason: str) -> None:
         # Send SIGTERM to all process groups first.
         for r in list(running.values()):
             pid = int(r.popen.pid)
@@ -310,6 +373,7 @@ def run_jobs(
                 status=reason_status,
                 finished_utc=now_utc_iso(),
                 returncode=r.popen.poll(),
+                reason=reason,
             )
             try:
                 r.stdout_fh.close()
@@ -339,24 +403,39 @@ def run_jobs(
 
     try:
         while pending or running:
-            # Launch as many jobs as we can (subject to GPU + max-running constraints).
+            # Launch as many jobs as we can:
+            # - keep pending spec order
+            # - repeatedly scan left-to-right
+            # - start first runnable job that fits available GPUs
             while pending and len(running) < int(spec.max_running_jobs):
-                job = pending[0]
-                allocated = allocator.allocate(int(job.resources.gpus))
-                if allocated is None:
-                    break
-                pending.pop(0)
+                launched = False
+                for idx, job in enumerate(pending):
+                    if not _is_job_runnable(job):
+                        continue
+                    allocated = allocator.allocate(int(job.resources.gpus))
+                    if allocated is None:
+                        continue
 
-                rjob = start_job(job, allocated_gpus=list(allocated))
-                running[job.job_id] = rjob
-                update_job_state(
-                    job.job_id,
-                    status="running",
-                    assigned_gpus=list(allocated),
-                    pid=int(rjob.popen.pid),
-                    started_utc=rjob.started_utc,
-                )
-                print(f">>> START job_id={job.job_id} kind={job.kind} gpus={allocated} pid={rjob.popen.pid}", flush=True)
+                    pending.pop(idx)
+                    rjob = start_job(job, allocated_gpus=list(allocated))
+                    running[job.job_id] = rjob
+                    update_job_state(
+                        job.job_id,
+                        status="running",
+                        assigned_gpus=list(allocated),
+                        pid=int(rjob.popen.pid),
+                        started_utc=rjob.started_utc,
+                        reason=None,
+                    )
+                    print(
+                        f">>> START job_id={job.job_id} kind={job.kind} depends_on={list(job.depends_on)} "
+                        f"gpus={allocated} pid={rjob.popen.pid}",
+                        flush=True,
+                    )
+                    launched = True
+                    break
+                if not launched:
+                    break
 
             # Poll running jobs for completion.
             any_failed = None
@@ -368,7 +447,7 @@ def run_jobs(
                 status: JobStatus = "success" if int(rc) == 0 else "failed"
                 finished_utc = now_utc_iso()
                 allocator.release(r.gpu_ids)
-                update_job_state(job_id, status=status, finished_utc=finished_utc, returncode=int(rc))
+                update_job_state(job_id, status=status, finished_utc=finished_utc, returncode=int(rc), reason=None)
                 print(f">>> DONE job_id={job_id} status={status} rc={rc}", flush=True)
 
                 try:
@@ -404,13 +483,64 @@ def run_jobs(
 
             if any_failed and spec.fail_fast:
                 print(f">>> FAIL_FAST triggered by job_id={any_failed}. Terminating remaining jobs...", flush=True)
-                terminate_all("canceled")
+                terminate_all("canceled", reason="canceled_by_fail_fast")
+                _cancel_pending_jobs(
+                    reason_for_job=lambda job: (
+                        "upstream_failed" if _has_transitive_non_success_dependency(job.job_id) else "canceled_by_fail_fast"
+                    )
+                )
+                break
+
+            # Dependency deadlock / unsatisfiable pending jobs:
+            # pending exists, nothing running, and none pending is runnable.
+            if pending and not running:
+                runnable_jobs = [job for job in pending if _is_job_runnable(job)]
+                if not runnable_jobs:
+                    print(
+                        ">>> DEADLOCK no runnable pending jobs remain; dependencies are unsatisfied.",
+                        flush=True,
+                    )
+                    for job in pending:
+                        dep_states = [f"{dep_id}:{_job_status(dep_id)}" for dep_id in job.depends_on]
+                        upstream_failed = any(_job_status(dep_id) in {"failed", "canceled"} for dep_id in job.depends_on)
+                        reason = "blocked_upstream_failed" if upstream_failed else "blocked_upstream_not_finished"
+                        print(
+                            f">>> BLOCKED job_id={job.job_id} reason={reason} unmet_dependencies={dep_states}",
+                            flush=True,
+                        )
+                    _cancel_pending_jobs(
+                        reason_for_job=lambda job: (
+                            "upstream_failed"
+                            if any(_job_status(dep_id) in {"failed", "canceled"} for dep_id in job.depends_on)
+                            else "deadlock_unsatisfied_dependencies"
+                        )
+                    )
+                else:
+                    # Runnable jobs may appear right after polling completes.
+                    # If any runnable job can fit the configured GPU pool, allow
+                    # the next scheduler iteration to launch it.
+                    max_total_gpus = len(spec.gpus)
+                    if any(int(job.resources.gpus) <= max_total_gpus for job in runnable_jobs):
+                        time.sleep(float(poll_interval_s))
+                        continue
+                    print(
+                        ">>> DEADLOCK runnable jobs exist but none can be allocated on configured GPUs.",
+                        flush=True,
+                    )
+                    for job in runnable_jobs:
+                        print(
+                            f">>> BLOCKED job_id={job.job_id} reason=insufficient_gpus "
+                            f"requested={int(job.resources.gpus)} free_now={allocator.free_gpus}",
+                            flush=True,
+                        )
+                    _cancel_pending_jobs(reason_for_job=lambda _job: "deadlock_insufficient_gpus")
                 break
 
             time.sleep(float(poll_interval_s))
     except KeyboardInterrupt:
         print(">>> INTERRUPT received. Canceling batch...", flush=True)
-        terminate_all("canceled")
+        terminate_all("canceled", reason="canceled_by_interrupt")
+        _cancel_pending_jobs(reason_for_job=lambda _job: "canceled_by_interrupt")
     finally:
         state["finished_utc"] = now_utc_iso()
         _write_state(state_path_p, state)

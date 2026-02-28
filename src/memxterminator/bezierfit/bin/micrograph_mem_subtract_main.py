@@ -23,9 +23,10 @@ from memxterminator.mxt_state import (
     parse_relion_image_name_1based,
     read_mxt,
     release_lock,
-    to_subtracted_micrograph_path,
-    to_subtracted_stack_path_in_root,
+    to_output_micrograph_path,
+    to_output_stack_path_in_root,
     try_acquire_lock,
+    validate_output_dirname,
     write_json_atomic,
     write_mrc_atomic,
 )
@@ -33,6 +34,18 @@ from memxterminator.path_resolve import infer_input_base_dir, normalise_dir, res
 
 _WORKER_RUNNER = None
 _EVENT_LOG_PATH: str | None = None
+
+
+class DependencyPreflightError(RuntimeError):
+    pass
+
+
+class DependencyRuntimeError(RuntimeError):
+    pass
+
+
+class StarRewriteError(RuntimeError):
+    pass
 
 
 def _init_worker(config: dict) -> None:
@@ -109,31 +122,95 @@ def _append_event_log(level: str, event: str, **fields: object) -> None:
         pass
 
 
-def _read_particles_table(star_path: str):
+def _read_star_object(star_path: str):
     """
-    Read a STAR file and return the particle table DataFrame.
+    Read STAR content and preserve block structure when possible.
 
     Supports single-block and multi-block STAR files.
     """
     try:
-        obj = starfile.read(star_path, always_dict=True)
+        return starfile.read(star_path, always_dict=True)
     except TypeError:
-        obj = starfile.read(star_path)
+        return starfile.read(star_path)
 
-    # Import pandas lazily only for type checks; starfile already depends on it.
+
+def _select_particles_table(star_obj, *, star_path: str):
+    """
+    Select the unique particles table block containing required columns.
+
+    Candidate rule:
+    - DataFrame with both `rlnImageName` and `rlnMicrographName`.
+    """
     import pandas as pd  # type: ignore
 
-    if isinstance(obj, pd.DataFrame):
-        return obj
-    if isinstance(obj, Mapping):
-        # Prefer a block that contains per-particle columns.
-        for _name, df in obj.items():
-            if isinstance(df, pd.DataFrame) and "rlnImageName" in df.columns:
-                return df
-        for _name, df in obj.items():
-            if isinstance(df, pd.DataFrame):
-                return df
-    raise TypeError(f"Unsupported STAR content for {star_path!r}: {type(obj).__name__}")
+    if isinstance(star_obj, pd.DataFrame):
+        cols = set(str(c) for c in star_obj.columns)
+        if {"rlnImageName", "rlnMicrographName"}.issubset(cols):
+            return None, star_obj
+        if len(star_obj) == 0:
+            df_empty = star_obj.copy()
+            if "rlnImageName" not in df_empty.columns:
+                df_empty["rlnImageName"] = pd.Series([], dtype=object)
+            if "rlnMicrographName" not in df_empty.columns:
+                df_empty["rlnMicrographName"] = pd.Series([], dtype=object)
+            return None, df_empty
+        raise StarRewriteError(
+            "STAR particles table must contain columns: rlnImageName and rlnMicrographName.\n"
+            f"  star_path={star_path}"
+        )
+
+    if isinstance(star_obj, Mapping):
+        candidates: list[tuple[str, object]] = []
+        empty_particle_like: list[tuple[str, object]] = []
+        for block_name, block in star_obj.items():
+            if not isinstance(block, pd.DataFrame):
+                continue
+            cols = set(str(c) for c in block.columns)
+            if {"rlnImageName", "rlnMicrographName"}.issubset(cols):
+                candidates.append((str(block_name), block))
+                continue
+            if len(block) == 0 and "particle" in str(block_name).lower():
+                empty_particle_like.append((str(block_name), block))
+
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) == 0:
+            if len(empty_particle_like) == 1:
+                block_name, block = empty_particle_like[0]
+                block_empty = block.copy()
+                if "rlnImageName" not in block_empty.columns:
+                    block_empty["rlnImageName"] = pd.Series([], dtype=object)
+                if "rlnMicrographName" not in block_empty.columns:
+                    block_empty["rlnMicrographName"] = pd.Series([], dtype=object)
+                return block_name, block_empty
+            if len(empty_particle_like) > 1:
+                names = [name for name, _ in empty_particle_like]
+                raise StarRewriteError(
+                    "Ambiguous particles table: multiple empty particle-like STAR blocks found.\n"
+                    f"  star_path={star_path}\n"
+                    f"  candidate_blocks={names}"
+                )
+            raise StarRewriteError(
+                "Could not find a particles table containing both rlnImageName and rlnMicrographName.\n"
+                f"  star_path={star_path}"
+            )
+        names = [name for name, _ in candidates]
+        raise StarRewriteError(
+            "Ambiguous particles table: multiple STAR blocks contain both rlnImageName and rlnMicrographName.\n"
+            f"  star_path={star_path}\n"
+            f"  candidate_blocks={names}"
+        )
+
+    raise StarRewriteError(f"Unsupported STAR content for {star_path!r}: {type(star_obj).__name__}")
+
+
+def _read_particles_table(star_path: str):
+    """
+    Read a STAR file and return the selected particle table DataFrame.
+    """
+    star_obj = _read_star_object(star_path)
+    _block_name, df = _select_particles_table(star_obj, star_path=star_path)
+    return df
 
 class MicrographMembraneSubtract:
     def __init__(
@@ -146,8 +223,13 @@ class MicrographMembraneSubtract:
         adopt_existing_outputs: bool = False,
         skip_failed: bool = False,
         require_particle_mxt: bool = True,
+        strict_dependencies: bool = True,
         strict_output_check: bool = True,
         output_root: str | None = None,
+        particle_output_root: str | None = None,
+        output_dirname: str = "subtracted",
+        write_output_star: bool = True,
+        output_star_path: str | None = None,
     ):
         self.particles_selected_filename = particles_selected_filename
 
@@ -161,8 +243,17 @@ class MicrographMembraneSubtract:
         self.adopt_existing_outputs = bool(adopt_existing_outputs)
         self.skip_failed = bool(skip_failed)
         self.require_particle_mxt = bool(require_particle_mxt)
+        self.strict_dependencies = bool(strict_dependencies)
         self.strict_output_check = bool(strict_output_check)
         self.output_root = output_root
+        self.particle_output_root = (
+            normalise_dir(particle_output_root)
+            if (particle_output_root is not None and str(particle_output_root).strip() != "")
+            else None
+        )
+        self.output_dirname = validate_output_dirname(output_dirname)
+        self.write_output_star = bool(write_output_star)
+        self.output_star_path = output_star_path
 
         # `.mxt` stable params/hash for this invocation (pixel-affecting only).
         self.mxt_task = "bezierfit_micrograph_mms"
@@ -237,6 +328,181 @@ class MicrographMembraneSubtract:
                 raise ValueError(f"Empty rlnMicrographName for stack: {stack_path}")
             pairs.append((stack_path, resolve_path(mg, base_dir=self.input_base_dir)))
         return pairs
+
+    def _dependency_output_root(self) -> str | None:
+        return self.particle_output_root if self.particle_output_root is not None else self.output_root
+
+    def _dependency_stack_path(self, raw_stack: str) -> str:
+        return to_output_stack_path_in_root(
+            raw_stack,
+            output_root=self._dependency_output_root(),
+            output_dirname=self.output_dirname,
+        )
+
+    def _raise_dependency_failure(self, issues: list[str], *, heading: str) -> None:
+        preview_n = 12
+        lines = [
+            heading,
+            f"output_root={self.output_root!r}",
+            f"particle_output_root={self.particle_output_root!r}",
+            f"output_dirname={self.output_dirname!r}",
+            f"missing_count={len(issues)}",
+            "missing_entries:",
+        ]
+        for issue in issues[:preview_n]:
+            lines.append(f"  - {issue}")
+        if len(issues) > preview_n:
+            lines.append(f"  - ... and {len(issues) - preview_n} more")
+        lines.append(
+            "Hint: set scheduler depends_on for MMS->PMS, or pass --particle_output_root to the PMS output root."
+        )
+        raise DependencyPreflightError("\n".join(lines))
+
+    def preflight_check_dependencies(self) -> None:
+        """
+        Fail-fast dependency validation before multiprocessing starts.
+        """
+        if not self.strict_dependencies:
+            return
+
+        dep_root = self._dependency_output_root()
+        if self.particle_output_root is not None:
+            if not os.path.exists(self.particle_output_root):
+                self._raise_dependency_failure(
+                    [f"particle_output_root_missing path={self.particle_output_root}"],
+                    heading="Dependency preflight failed: particle_output_root does not exist.",
+                )
+            if not os.path.isdir(self.particle_output_root):
+                self._raise_dependency_failure(
+                    [f"particle_output_root_not_directory path={self.particle_output_root}"],
+                    heading="Dependency preflight failed: particle_output_root is not a directory.",
+                )
+
+        issues: list[str] = []
+        seen_stacks: set[str] = set()
+        for raw_stack in self.rawimage_stacks_name_lst:
+            raw_stack_s = str(raw_stack)
+            if raw_stack_s in seen_stacks:
+                continue
+            seen_stacks.add(raw_stack_s)
+
+            dep_stack = self._dependency_stack_path(raw_stack_s)
+            dep_mxt = dep_stack + ".mxt"
+            if not os.path.exists(dep_stack):
+                issues.append(f"missing_stack path={dep_stack}")
+                continue
+
+            if self.require_particle_mxt:
+                if not os.path.exists(dep_mxt):
+                    issues.append(f"missing_mxt path={dep_mxt}")
+                    continue
+                try:
+                    dep_obj = read_mxt(dep_mxt)
+                except Exception as exc:
+                    issues.append(f"invalid_mxt path={dep_mxt} error={type(exc).__name__}")
+                    continue
+                if dep_obj.get("task") != "bezierfit_particle_pms":
+                    issues.append(f"mxt_wrong_task path={dep_mxt} task={dep_obj.get('task')!r}")
+                    continue
+                if dep_obj.get("status") != "success":
+                    issues.append(f"mxt_not_success path={dep_mxt} status={dep_obj.get('status')!r}")
+                    continue
+                dep_hash = dep_obj.get("params_hash")
+                if not isinstance(dep_hash, str) or dep_hash.strip() == "":
+                    issues.append(f"mxt_missing_hash path={dep_mxt}")
+
+        if issues:
+            self._raise_dependency_failure(issues, heading="Dependency preflight failed.")
+
+        # Validate micrograph inputs once up front in strict mode.
+        missing_micrographs = [mg for _stack, mg in self.raw_mg_name_lst if not os.path.exists(mg)]
+        if missing_micrographs:
+            issues = [f"missing_micrograph path={p}" for p in missing_micrographs[:256]]
+            self._raise_dependency_failure(issues, heading="Dependency preflight failed: missing input micrograph files.")
+
+        # Validate output directory writability once up front in strict mode.
+        output_dirs: set[str] = set()
+        for _raw_stack, micrograph_path in self.raw_mg_name_lst:
+            out_micrograph = to_output_micrograph_path(
+                micrograph_path,
+                output_root=self.output_root,
+                output_dirname=self.output_dirname,
+            )
+            output_dirs.add(str(Path(out_micrograph).parent))
+
+        issues = []
+        for out_dir_str in sorted(output_dirs):
+            out_dir = Path(out_dir_str)
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                probe = out_dir / f".mms_preflight_write_probe_{os.getpid()}"
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("ok\n")
+                try:
+                    probe.unlink()
+                except Exception:
+                    pass
+            except Exception as exc:
+                issues.append(f"cannot_create_output_dir path={out_dir} error={type(exc).__name__}: {exc}")
+        if issues:
+            self._raise_dependency_failure(
+                issues[:256],
+                heading="Dependency preflight failed: output directory is not writable.",
+            )
+
+    def _default_output_star_path(self) -> str:
+        input_star = Path(self.particles_selected_filename)
+        out_name = f"{input_star.stem}_mms_micrograph_{self.output_dirname}.star"
+        if self.output_root is not None and str(self.output_root).strip() != "":
+            return str(Path(self.output_root) / out_name)
+        return str(input_star.parent / out_name)
+
+    def write_output_star_file(self, output_star_path: str | None = None) -> str:
+        """
+        Rewrite `rlnMicrographName` to the mapped output path and write STAR.
+        """
+        star_obj = _read_star_object(self.particles_selected_filename)
+        block_name, df_particles = _select_particles_table(star_obj, star_path=self.particles_selected_filename)
+
+        if "rlnMicrographName" not in df_particles.columns:
+            raise StarRewriteError(
+                "Particles table is missing required column rlnMicrographName.\n"
+                f"  star_path={self.particles_selected_filename}"
+            )
+
+        rewritten = df_particles.copy()
+        mapped_micrographs: list[str] = []
+        for raw_mg in rewritten["rlnMicrographName"].astype(str).tolist():
+            mg = str(raw_mg).strip()
+            if mg == "":
+                raise StarRewriteError(
+                    "Particles table contains empty rlnMicrographName entries.\n"
+                    f"  star_path={self.particles_selected_filename}"
+                )
+            mg_abs = resolve_path(mg, base_dir=self.input_base_dir)
+            mapped_path = to_output_micrograph_path(
+                mg_abs,
+                output_root=self.output_root,
+                output_dirname=self.output_dirname,
+            )
+            mapped_micrographs.append(os.path.abspath(mapped_path))
+        rewritten["rlnMicrographName"] = mapped_micrographs
+
+        target = output_star_path if (output_star_path is not None and str(output_star_path).strip() != "") else self.output_star_path
+        if target is None or str(target).strip() == "":
+            target = self._default_output_star_path()
+        target_path = Path(str(target))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(star_obj, Mapping):
+            out_obj = dict(star_obj)
+            if block_name is None:
+                raise StarRewriteError("Internal error: missing particles table block name for multi-block STAR.")
+            out_obj[block_name] = rewritten
+            starfile.write(out_obj, str(target_path), overwrite=True)
+        else:
+            starfile.write(rewritten, str(target_path), overwrite=True)
+        return str(target_path)
 
     def get_df_temp(self, rawimage_stacks_name):
         df_temp = self.df_star[self.df_star["_memx_stack_path"] == rawimage_stacks_name]
@@ -331,13 +597,15 @@ class MicrographMembraneSubtract:
         setproctitle("MemXTerminator-MMS")
         rawimage_stacks_name, micrograph_name = raw_mg_name
 
-        particle_stack_subtracted_path = to_subtracted_stack_path_in_root(
-            rawimage_stacks_name, output_root=self.output_root
-        )
+        particle_stack_subtracted_path = self._dependency_stack_path(rawimage_stacks_name)
         particle_stack_mxt_path = particle_stack_subtracted_path + ".mxt"
 
         if not os.path.exists(particle_stack_subtracted_path):
-            print(f">>> BLOCKED_DEPENDENCY missing_stack={particle_stack_subtracted_path} micrograph={micrograph_name}")
+            message = (
+                f">>> BLOCKED_DEPENDENCY missing_stack={particle_stack_subtracted_path} "
+                f"micrograph={micrograph_name}"
+            )
+            print(message)
             _append_event_log(
                 "WARN",
                 "BLOCKED_DEPENDENCY",
@@ -346,10 +614,16 @@ class MicrographMembraneSubtract:
                 micrograph=micrograph_name,
                 reason="MISSING_PARTICLE_STACK",
             )
+            if self.strict_dependencies:
+                raise DependencyRuntimeError(message)
             return
 
         if not os.path.exists(micrograph_name):
-            print(f">>> BLOCKED_DEPENDENCY missing_micrograph={micrograph_name} stack={particle_stack_subtracted_path}")
+            message = (
+                f">>> BLOCKED_DEPENDENCY missing_micrograph={micrograph_name} "
+                f"stack={particle_stack_subtracted_path}"
+            )
+            print(message)
             _append_event_log(
                 "WARN",
                 "BLOCKED_DEPENDENCY",
@@ -358,12 +632,18 @@ class MicrographMembraneSubtract:
                 micrograph=micrograph_name,
                 reason="MISSING_MICROGRAPH",
             )
+            if self.strict_dependencies:
+                raise DependencyRuntimeError(message)
             return
 
         particle_pms_params_hash = None
         if self.require_particle_mxt:
             if not os.path.exists(particle_stack_mxt_path):
-                print(f">>> BLOCKED_DEPENDENCY missing_mxt={particle_stack_mxt_path} micrograph={micrograph_name}")
+                message = (
+                    f">>> BLOCKED_DEPENDENCY missing_mxt={particle_stack_mxt_path} "
+                    f"micrograph={micrograph_name}"
+                )
+                print(message)
                 _append_event_log(
                     "WARN",
                     "BLOCKED_DEPENDENCY",
@@ -373,11 +653,17 @@ class MicrographMembraneSubtract:
                     reason="MISSING_PARTICLE_MXT",
                     particle_stack_mxt=particle_stack_mxt_path,
                 )
+                if self.strict_dependencies:
+                    raise DependencyRuntimeError(message)
                 return
             try:
                 dep = read_mxt(particle_stack_mxt_path)
             except Exception:
-                print(f">>> BLOCKED_DEPENDENCY invalid_mxt={particle_stack_mxt_path} micrograph={micrograph_name}")
+                message = (
+                    f">>> BLOCKED_DEPENDENCY invalid_mxt={particle_stack_mxt_path} "
+                    f"micrograph={micrograph_name}"
+                )
+                print(message)
                 _append_event_log(
                     "WARN",
                     "BLOCKED_DEPENDENCY",
@@ -387,10 +673,16 @@ class MicrographMembraneSubtract:
                     reason="INVALID_PARTICLE_MXT",
                     particle_stack_mxt=particle_stack_mxt_path,
                 )
+                if self.strict_dependencies:
+                    raise DependencyRuntimeError(message)
                 return
 
             if dep.get("task") != "bezierfit_particle_pms" or dep.get("status") != "success":
-                print(f">>> BLOCKED_DEPENDENCY particle_mxt_not_success={particle_stack_mxt_path} micrograph={micrograph_name}")
+                message = (
+                    f">>> BLOCKED_DEPENDENCY particle_mxt_not_success={particle_stack_mxt_path} "
+                    f"micrograph={micrograph_name}"
+                )
+                print(message)
                 _append_event_log(
                     "WARN",
                     "BLOCKED_DEPENDENCY",
@@ -402,11 +694,17 @@ class MicrographMembraneSubtract:
                     particle_mxt_status=dep.get("status"),
                     particle_mxt_task=dep.get("task"),
                 )
+                if self.strict_dependencies:
+                    raise DependencyRuntimeError(message)
                 return
 
             particle_pms_params_hash = dep.get("params_hash")
             if not isinstance(particle_pms_params_hash, str) or particle_pms_params_hash == "":
-                print(f">>> BLOCKED_DEPENDENCY particle_mxt_missing_hash={particle_stack_mxt_path} micrograph={micrograph_name}")
+                message = (
+                    f">>> BLOCKED_DEPENDENCY particle_mxt_missing_hash={particle_stack_mxt_path} "
+                    f"micrograph={micrograph_name}"
+                )
+                print(message)
                 _append_event_log(
                     "WARN",
                     "BLOCKED_DEPENDENCY",
@@ -416,6 +714,8 @@ class MicrographMembraneSubtract:
                     reason="PARTICLE_MXT_MISSING_HASH",
                     particle_stack_mxt=particle_stack_mxt_path,
                 )
+                if self.strict_dependencies:
+                    raise DependencyRuntimeError(message)
                 return
         else:
             if os.path.exists(particle_stack_mxt_path):
@@ -426,7 +726,11 @@ class MicrographMembraneSubtract:
                 except Exception:
                     particle_pms_params_hash = None
 
-        out_micrograph = to_subtracted_micrograph_path(micrograph_name, output_root=self.output_root)
+        out_micrograph = to_output_micrograph_path(
+            micrograph_name,
+            output_root=self.output_root,
+            output_dirname=self.output_dirname,
+        )
         mxt_path = out_micrograph + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -738,8 +1042,13 @@ class MicrographMembraneSubtract:
             "adopt_existing_outputs": bool(self.adopt_existing_outputs),
             "skip_failed": bool(self.skip_failed),
             "require_particle_mxt": bool(self.require_particle_mxt),
+            "strict_dependencies": bool(self.strict_dependencies),
             "strict_output_check": bool(self.strict_output_check),
             "output_root": self.output_root,
+            "particle_output_root": self.particle_output_root,
+            "output_dirname": self.output_dirname,
+            "write_output_star": bool(self.write_output_star),
+            "output_star_path": self.output_star_path,
         }
 
         minibatches = list(chunks(self.raw_mg_name_lst, int(batch_size)))
@@ -785,7 +1094,25 @@ if __name__ == '__main__':
         "--output_root",
         type=str,
         default=None,
-        help="If set, read/write all outputs under <output_root>/subtracted/... (isolates sweeps/batches).",
+        help=(
+            "Where this MMS job writes outputs. "
+            "Outputs are written under <output_root>/<output_dirname>/... when set."
+        ),
+    )
+    parser.add_argument(
+        "--particle_output_root",
+        type=str,
+        default=None,
+        help=(
+            "Where MMS reads upstream PMS particle-stack outputs from. "
+            "If omitted, falls back to --output_root (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--output_dirname",
+        type=str,
+        default="subtracted",
+        help="Output folder name (default: subtracted). Must be a single path segment.",
     )
     parser.add_argument(
         "--resume",
@@ -817,7 +1144,29 @@ if __name__ == '__main__':
         default=True,
         help="Require dependency particle-stack .mxt sidecars to exist and be success (default: enabled).",
     )
+    parser.add_argument(
+        "--strict_dependencies",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fail-fast preflight for dependencies before multiprocessing "
+            "(default: enabled). Disable to keep legacy best-effort behavior."
+        ),
+    )
+    parser.add_argument(
+        "--write_output_star",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write output STAR with rewritten absolute rlnMicrographName paths (default: enabled).",
+    )
+    parser.add_argument(
+        "--output_star_path",
+        type=str,
+        default=None,
+        help="Optional explicit path for output STAR; default is deterministic based on input STAR and output_dirname.",
+    )
     args = parser.parse_args()
+
     if args.output_root:
         try:
             _EVENT_LOG_PATH = os.fspath(args.output_root) + os.sep + "mms_run_data.log"
@@ -826,24 +1175,46 @@ if __name__ == '__main__':
     else:
         _EVENT_LOG_PATH = "mms_run_data.log"
 
-    mms = MicrographMembraneSubtract(
-        args.particles_selected_filename,
-        input_base_dir=args.input_base_dir,
-        resume=args.resume,
-        force=args.force,
-        adopt_existing_outputs=args.adopt_existing_outputs,
-        skip_failed=args.skip_failed,
-        require_particle_mxt=args.require_particle_mxt,
-        output_root=args.output_root,
-    )
+    try:
+        mms = MicrographMembraneSubtract(
+            args.particles_selected_filename,
+            input_base_dir=args.input_base_dir,
+            resume=args.resume,
+            force=args.force,
+            adopt_existing_outputs=args.adopt_existing_outputs,
+            skip_failed=args.skip_failed,
+            require_particle_mxt=args.require_particle_mxt,
+            strict_dependencies=args.strict_dependencies,
+            output_root=args.output_root,
+            particle_output_root=args.particle_output_root,
+            output_dirname=args.output_dirname,
+            write_output_star=args.write_output_star,
+            output_star_path=args.output_star_path,
+        )
 
-    procs = int(args.procs)
-    if procs <= 0:
-        try:
-            import cupy as _cp
+        procs = int(args.procs)
+        if procs <= 0:
+            try:
+                import cupy as _cp
 
-            procs = int(_cp.cuda.runtime.getDeviceCount())
-        except Exception:
-            procs = 1
+                procs = int(_cp.cuda.runtime.getDeviceCount())
+            except Exception:
+                procs = 1
 
-    mms.micrograph_mem_subtract_multiprocessing(procs, args.batch_size)
+        if bool(args.strict_dependencies):
+            mms.preflight_check_dependencies()
+
+        mms.micrograph_mem_subtract_multiprocessing(procs, args.batch_size)
+
+        if bool(args.write_output_star):
+            out_star = mms.write_output_star_file(output_star_path=args.output_star_path)
+            print(f">>> OUTPUT_STAR {out_star}")
+    except (DependencyPreflightError, DependencyRuntimeError) as exc:
+        print(str(exc), flush=True)
+        raise SystemExit(3)
+    except StarRewriteError as exc:
+        print(str(exc), flush=True)
+        raise SystemExit(4)
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1)

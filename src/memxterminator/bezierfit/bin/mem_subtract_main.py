@@ -21,8 +21,9 @@ from memxterminator.mxt_state import (
     is_uptodate,
     read_mxt,
     release_lock,
-    to_subtracted_stack_path_in_root,
+    to_output_stack_path_in_root,
     try_acquire_lock,
+    validate_output_dirname,
     write_json_atomic,
     write_mrc_atomic,
 )
@@ -144,6 +145,7 @@ class BezierfitParticleMembraneSubtract:
         skip_failed: bool = False,
         strict_output_check: bool = True,
         output_root: str | None = None,
+        output_dirname: str = "subtracted",
     ):
         self.particle_cs = particle_cs
         self.template_cs = template_cs
@@ -155,6 +157,7 @@ class BezierfitParticleMembraneSubtract:
         self.skip_failed = bool(skip_failed)
         self.strict_output_check = bool(strict_output_check)
         self.output_root = output_root
+        self.output_dirname = validate_output_dirname(output_dirname)
 
         if input_base_dir is not None and str(input_base_dir).strip() != "":
             self.input_base_dir = normalise_dir(input_base_dir)
@@ -284,7 +287,11 @@ class BezierfitParticleMembraneSubtract:
         setproctitle("MemXTerminator-bezPMS")
 
         raw_stack = particle_filename
-        out_stack = to_subtracted_stack_path_in_root(raw_stack, output_root=self.output_root)
+        out_stack = to_output_stack_path_in_root(
+            raw_stack,
+            output_root=self.output_root,
+            output_dirname=self.output_dirname,
+        )
         mxt_path = out_stack + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -547,7 +554,16 @@ def main() -> None:
         "--output_root",
         type=str,
         default=None,
-        help="If set, write all outputs under <output_root>/subtracted/... (isolates sweeps/batches).",
+        help="If set, write outputs under <output_root>/<output_dirname>/... (isolates sweeps/batches).",
+    )
+    parser.add_argument(
+        "--output_dirname",
+        type=str,
+        default="subtracted",
+        help=(
+            "Output folder name under output_root for generated stacks "
+            "(default: subtracted). Must be a single path segment."
+        ),
     )
     parser.add_argument(
         "--procs",
@@ -612,6 +628,7 @@ def main() -> None:
         adopt_existing_outputs=args.adopt_existing_outputs,
         skip_failed=args.skip_failed,
         output_root=args.output_root,
+        output_dirname=args.output_dirname,
     )
 
     print(">>> Preparing Bezierfit Particle Membrane Subtraction dataset...")
@@ -654,6 +671,7 @@ def main() -> None:
         "adopt_existing_outputs": bool(args.adopt_existing_outputs),
         "skip_failed": bool(args.skip_failed),
         "output_root": args.output_root,
+        "output_dirname": args.output_dirname,
     }
 
     minibatches = list(_chunks(stack_paths, batch_size))

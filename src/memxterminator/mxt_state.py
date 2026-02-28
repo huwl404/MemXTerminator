@@ -171,37 +171,67 @@ def parse_relion_image_name_1based(image_name: str) -> Tuple[str, int]:
     return right, idx
 
 
-def to_subtracted_stack_path(stack_path: os.PathLike[str] | str) -> str:
+def validate_output_dirname(output_dirname: os.PathLike[str] | str) -> str:
     """
-    Map a particle stack path to its subtracted-output path (idempotent).
+    Validate a user-provided output directory name.
 
-    Rules (Spec v1):
-    - If already in a `subtracted/` directory OR already ends with `_subtracted.mrc` /
+    Rules:
+    - Must be a single path segment.
+    - Must be non-empty.
+    - Must not be `.` or `..`.
+    - Must not contain path separators.
+    """
+    raw = os.fspath(output_dirname)
+    name = str(raw).strip()
+    if name == "":
+        raise ValueError("output_dirname must be non-empty")
+    if name in {".", ".."}:
+        raise ValueError(f"Invalid output_dirname {name!r}: '.' and '..' are not allowed")
+    if "/" in name or "\\" in name:
+        raise ValueError(
+            f"Invalid output_dirname {name!r}: expected a single path segment without path separators"
+        )
+    if Path(name).name != name:
+        raise ValueError(
+            f"Invalid output_dirname {name!r}: expected a single path segment without path separators"
+        )
+    return name
+
+
+def to_output_stack_path(
+    stack_path: os.PathLike[str] | str,
+    *,
+    output_dirname: os.PathLike[str] | str = "subtracted",
+) -> str:
+    """
+    Map a particle stack path to an output stack path (idempotent).
+
+    Rules:
+    - If already in `<output_dirname>/` OR already ends with `_subtracted.mrc` /
       `_subtracted.mrcs`, return as-is.
     - Else:
-      - Replace directory component `/extract/` -> `/subtracted/`
+      - Replace directory component `/extract/` -> `/<output_dirname>/`
       - Insert `_subtracted` before extension (`.mrc` or `.mrcs`)
     """
+    out_dirname = validate_output_dirname(output_dirname)
     p = _normalise_path(stack_path)
     path_obj = Path(p)
 
     suffix = path_obj.suffix.lower()
     if suffix not in {".mrc", ".mrcs"}:
-        # Keep behaviour conservative: only map supported stack types.
         return p
 
     stem_lower = path_obj.stem.lower()
     if stem_lower.endswith("_subtracted"):
         return p
 
-    if "subtracted" in {part.lower() for part in path_obj.parts}:
+    if out_dirname.lower() in {part.lower() for part in path_obj.parts}:
         return p
 
-    # Directory mapping: replace a path segment named 'extract' with 'subtracted' (first occurrence).
     parts = list(path_obj.parts)
     for i, part in enumerate(parts):
         if part.lower() == "extract":
-            parts[i] = "subtracted"
+            parts[i] = out_dirname
             break
     mapped_dir = Path(*parts[:-1])
 
@@ -209,51 +239,52 @@ def to_subtracted_stack_path(stack_path: os.PathLike[str] | str) -> str:
     return str(mapped_dir / mapped_name)
 
 
-def to_subtracted_stack_path_in_root(
+def to_output_stack_path_in_root(
     stack_path: os.PathLike[str] | str,
     *,
     output_root: os.PathLike[str] | str | None = None,
+    output_dirname: os.PathLike[str] | str = "subtracted",
 ) -> str:
     """
-    Like `to_subtracted_stack_path`, but optionally place outputs under `output_root`.
-
-    This is the key primitive that enables safe parameter sweeps / batch runs on
-    the same input data without output collisions.
+    Like `to_output_stack_path`, but optionally place outputs under `output_root`.
 
     Rules:
-    - If `output_root` is None: return `to_subtracted_stack_path(stack_path)` unchanged.
-    - Else: preserve the relative subtree starting at the first `subtracted/`
-      segment if present; otherwise, place the mapped filename under
-      `<output_root>/subtracted/`.
+    - If `output_root` is None: return `to_output_stack_path(stack_path, output_dirname=...)`.
+    - Else: preserve the relative subtree starting at `<output_dirname>/`
+      if present; otherwise, place the mapped filename under
+      `<output_root>/<output_dirname>/`.
     """
-    base = Path(to_subtracted_stack_path(stack_path))
+    out_dirname = validate_output_dirname(output_dirname)
+    base = Path(to_output_stack_path(stack_path, output_dirname=out_dirname))
     if output_root is None:
         return str(base)
 
     out_root = Path(_normalise_path(output_root))
     parts_lower = [p.lower() for p in base.parts]
     try:
-        sub_idx = parts_lower.index("subtracted")
+        sub_idx = parts_lower.index(out_dirname.lower())
     except ValueError:
         sub_idx = -1
 
     if sub_idx >= 0:
         return str(out_root / Path(*base.parts[sub_idx:]))
-    return str(out_root / "subtracted" / base.name)
+    return str(out_root / out_dirname / base.name)
 
 
-def to_subtracted_micrograph_path(
+def to_output_micrograph_path(
     micrograph_path: os.PathLike[str] | str,
     *,
     output_root: os.PathLike[str] | str | None = None,
+    output_dirname: os.PathLike[str] | str = "subtracted",
 ) -> str:
     """
-    Derive a micrograph subtraction output path for Bezierfit micrograph MMS.
+    Derive a micrograph output path for Bezierfit micrograph MMS.
 
     - Output name: `<stem>_subtracted<suffix>` (idempotent if already suffixed)
-    - Default output dir (Spec v1 legacy): `<micrograph>/../.. / subtracted`
-    - If `output_root` is provided: `<output_root>/subtracted/<name>`
+    - Default output dir: `<micrograph>/../.. / <output_dirname>`
+    - If `output_root` is provided: `<output_root>/<output_dirname>/<name>`
     """
+    out_dirname = validate_output_dirname(output_dirname)
     p = Path(_normalise_path(micrograph_path))
     suffix = p.suffix
     stem = p.stem
@@ -263,11 +294,40 @@ def to_subtracted_micrograph_path(
         out_name = f"{stem}_subtracted{suffix}"
 
     if output_root is None:
-        out_dir = p.parent.parent / "subtracted"
+        out_dir = p.parent.parent / out_dirname
     else:
-        out_dir = Path(_normalise_path(output_root)) / "subtracted"
+        out_dir = Path(_normalise_path(output_root)) / out_dirname
 
     return str(out_dir / out_name)
+
+
+def to_subtracted_stack_path(stack_path: os.PathLike[str] | str) -> str:
+    """
+    Backward-compatible wrapper for `output_dirname="subtracted"`.
+    """
+    return to_output_stack_path(stack_path, output_dirname="subtracted")
+
+
+def to_subtracted_stack_path_in_root(
+    stack_path: os.PathLike[str] | str,
+    *,
+    output_root: os.PathLike[str] | str | None = None,
+) -> str:
+    """
+    Backward-compatible wrapper for `output_dirname="subtracted"`.
+    """
+    return to_output_stack_path_in_root(stack_path, output_root=output_root, output_dirname="subtracted")
+
+
+def to_subtracted_micrograph_path(
+    micrograph_path: os.PathLike[str] | str,
+    *,
+    output_root: os.PathLike[str] | str | None = None,
+) -> str:
+    """
+    Backward-compatible wrapper for `output_dirname="subtracted"`.
+    """
+    return to_output_micrograph_path(micrograph_path, output_root=output_root, output_dirname="subtracted")
 
 
 def is_uptodate(
@@ -479,15 +539,25 @@ if __name__ == "__main__":
     # Minimal self-test (developer convenience; no external fixtures).
     assert parse_relion_image_name_1based("3@foo.mrcs") == ("foo.mrcs", 3)
     assert parse_relion_image_name_1based("foo.mrc") == ("foo.mrc", 1)
+    assert validate_output_dirname("subtracted") == "subtracted"
     assert to_subtracted_stack_path("/a/extract/x.mrc") == "/a/subtracted/x_subtracted.mrc"
     assert to_subtracted_stack_path("/a/subtracted/x_subtracted.mrc") == "/a/subtracted/x_subtracted.mrc"
+    assert to_output_stack_path("/a/extract/x.mrc", output_dirname="class_01") == "/a/class_01/x_subtracted.mrc"
     assert (
         to_subtracted_stack_path_in_root("/a/extract/x.mrc", output_root="/tmp/run1")
         == "/tmp/run1/subtracted/x_subtracted.mrc"
     )
     assert (
+        to_output_stack_path_in_root("/a/extract/x.mrc", output_root="/tmp/run1", output_dirname="class_01")
+        == "/tmp/run1/class_01/x_subtracted.mrc"
+    )
+    assert (
         to_subtracted_micrograph_path("/a/micrographs/extract/mg_001.mrc", output_root="/tmp/run2")
         == "/tmp/run2/subtracted/mg_001_subtracted.mrc"
+    )
+    assert (
+        to_output_micrograph_path("/a/micrographs/extract/mg_001.mrc", output_root="/tmp/run2", output_dirname="class_01")
+        == "/tmp/run2/class_01/mg_001_subtracted.mrc"
     )
     assert compute_params_hash({"b": 1, "a": 2}) == compute_params_hash({"a": 2, "b": 1})
     print("memxterminator.mxt_state: self-test OK")

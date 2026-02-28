@@ -68,6 +68,7 @@ class _GuiJob:
     input_base_dir: str = ""
     custom_input_base_dir: bool = False
     args: dict[str, Any] = field(default_factory=dict)
+    depends_on: list[str] = field(default_factory=list)
     status: str = "queued"
     assigned_gpus: list[int] = field(default_factory=list)
     pid: int | None = None
@@ -87,6 +88,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self._jobs: list[_GuiJob] = []
         self._selected_row: int | None = None
         self._updating_table = False
+        self._dependency_errors: list[str] = []
 
         self._run_root: str = ""
         self._spec_path: str = ""
@@ -351,6 +353,13 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self.pmsBatchSizeEdit.setPlaceholderText("20")
         self.pmsBatchSizeEdit.setToolTip("Minibatch size when running multiple stacks per job.")
 
+        self.pmsOutputDirnameEdit = QtWidgets.QLineEdit(page)
+        self.pmsOutputDirnameEdit.setPlaceholderText("subtracted")
+        self.pmsOutputDirnameEdit.setToolTip(
+            "Output folder name under output_root (default: subtracted). "
+            "Use different names to avoid output collisions."
+        )
+
         self.pmsResumeCheck = QtWidgets.QCheckBox("Resume (.mxt)", page)
         self.pmsResumeCheck.setChecked(True)
         self.pmsForceCheck = QtWidgets.QCheckBox("Force recompute", page)
@@ -362,6 +371,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         form.addRow("Control points .json", self._hrow(self.pmsControlPointsEdit, self.pmsControlPointsBrowse))
         form.addRow("points_step", self.pmsPointsStepEdit)
         form.addRow("physical_membrane_dist", self.pmsPhysDistEdit)
+        form.addRow("output_dirname", self.pmsOutputDirnameEdit)
         form.addRow("batch_size", self.pmsBatchSizeEdit)
         form.addRow(self.pmsResumeCheck)
         form.addRow(self.pmsForceCheck)
@@ -374,6 +384,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.pmsControlPointsEdit,
             self.pmsPointsStepEdit,
             self.pmsPhysDistEdit,
+            self.pmsOutputDirnameEdit,
             self.pmsBatchSizeEdit,
         ]:
             w.editingFinished.connect(self._apply_editor_to_selected_job)
@@ -390,6 +401,26 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self.mmsParticleStarBrowse = QtWidgets.QPushButton("Browse...", page)
         self.mmsParticleStarBrowse.clicked.connect(lambda: self._browse_file(self.mmsParticleStarEdit, "STAR Files (*.star)"))
 
+        self.mmsDependsOnCombo = QtWidgets.QComboBox(page)
+        self.mmsDependsOnCombo.setToolTip(
+            "Select an upstream PMS job. MMS will wait for this dependency and "
+            "inherit particle_output_root/output_dirname by default."
+        )
+
+        self.mmsParticleOutputRootEdit = QtWidgets.QLineEdit(page)
+        self.mmsParticleOutputRootBrowse = QtWidgets.QPushButton("Browse...", page)
+        self.mmsParticleOutputRootBrowse.clicked.connect(self._browse_mms_particle_output_root)
+        self.mmsParticleOutputRootEdit.setToolTip(
+            "Optional explicit PMS output root for dependency lookup. "
+            "Leave empty to auto-inject from depends_on."
+        )
+
+        self.mmsOutputDirnameEdit = QtWidgets.QLineEdit(page)
+        self.mmsOutputDirnameEdit.setPlaceholderText("subtracted")
+        self.mmsOutputDirnameEdit.setToolTip(
+            "Output folder name for MMS outputs/dependency lookup (default: subtracted)."
+        )
+
         self.mmsBatchSizeEdit = QtWidgets.QLineEdit(page)
         self.mmsBatchSizeEdit.setPlaceholderText("30")
         self.mmsBatchSizeEdit.setToolTip("Minibatch size for micrograph subtraction.")
@@ -401,16 +432,52 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self.mmsSkipFailedCheck = QtWidgets.QCheckBox("Skip failed", page)
         self.mmsRequireParticleMxtCheck = QtWidgets.QCheckBox("Require particle-stack .mxt success", page)
         self.mmsRequireParticleMxtCheck.setChecked(True)
+        self.mmsStrictDepsCheck = QtWidgets.QCheckBox("Strict dependency preflight (fail-fast)", page)
+        self.mmsStrictDepsCheck.setChecked(True)
+        self.mmsWriteOutputStarCheck = QtWidgets.QCheckBox("Write output STAR", page)
+        self.mmsWriteOutputStarCheck.setChecked(True)
+
+        self.mmsOutputStarPathEdit = QtWidgets.QLineEdit(page)
+        self.mmsOutputStarPathEdit.setPlaceholderText("(auto)")
+        self.mmsOutputStarPathBrowse = QtWidgets.QPushButton("Browse...", page)
+        self.mmsOutputStarPathBrowse.clicked.connect(
+            lambda: self._save_file(
+                self.mmsOutputStarPathEdit,
+                "STAR Files (*.star)",
+                default_name="mms_micrograph_output.star",
+            )
+        )
+        self.mmsOutputStarPathEdit.setToolTip("Optional explicit output STAR path; blank uses deterministic default.")
+
+        self.mmsDependencyWarningLabel = QtWidgets.QLabel("", page)
+        self.mmsDependencyWarningLabel.setWordWrap(True)
+        self.mmsDependencyWarningLabel.setStyleSheet("color: #b26a00;")
 
         form.addRow("particles_selected.star", self._hrow(self.mmsParticleStarEdit, self.mmsParticleStarBrowse))
+        form.addRow("depends_on (PMS)", self.mmsDependsOnCombo)
+        form.addRow(
+            "particle_output_root",
+            self._hrow(self.mmsParticleOutputRootEdit, self.mmsParticleOutputRootBrowse),
+        )
+        form.addRow("output_dirname", self.mmsOutputDirnameEdit)
         form.addRow("batch_size", self.mmsBatchSizeEdit)
         form.addRow(self.mmsResumeCheck)
         form.addRow(self.mmsForceCheck)
         form.addRow(self.mmsAdoptCheck)
         form.addRow(self.mmsSkipFailedCheck)
         form.addRow(self.mmsRequireParticleMxtCheck)
+        form.addRow(self.mmsStrictDepsCheck)
+        form.addRow(self.mmsWriteOutputStarCheck)
+        form.addRow("output_star_path", self._hrow(self.mmsOutputStarPathEdit, self.mmsOutputStarPathBrowse))
+        form.addRow(self.mmsDependencyWarningLabel)
 
-        for w in [self.mmsParticleStarEdit, self.mmsBatchSizeEdit]:
+        for w in [
+            self.mmsParticleStarEdit,
+            self.mmsParticleOutputRootEdit,
+            self.mmsOutputDirnameEdit,
+            self.mmsBatchSizeEdit,
+            self.mmsOutputStarPathEdit,
+        ]:
             w.editingFinished.connect(self._apply_editor_to_selected_job)
         for c in [
             self.mmsResumeCheck,
@@ -418,8 +485,11 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.mmsAdoptCheck,
             self.mmsSkipFailedCheck,
             self.mmsRequireParticleMxtCheck,
+            self.mmsStrictDepsCheck,
+            self.mmsWriteOutputStarCheck,
         ]:
             c.stateChanged.connect(self._apply_editor_to_selected_job)
+        self.mmsDependsOnCombo.currentIndexChanged.connect(self._apply_editor_to_selected_job)
 
         return page
 
@@ -572,6 +642,12 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.customOutCheck.setChecked(True)
             self._apply_editor_to_selected_job()
 
+    def _browse_mms_particle_output_root(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select particle_output_root")
+        if path:
+            self.mmsParticleOutputRootEdit.setText(path)
+            self._apply_editor_to_selected_job()
+
     def _browse_input_base_dir(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select input base directory")
         if path:
@@ -656,6 +732,72 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             return str(job.input_base_dir).strip()
         return self._auto_infer_input_base_dir(job)
 
+    def _pms_job_ids(self) -> list[str]:
+        return [j.job_id for j in self._jobs if j.kind == "bezierfit_particle_pms"]
+
+    def _default_mms_dependency(self) -> str | None:
+        pms_ids = self._pms_job_ids()
+        if len(pms_ids) == 1:
+            return pms_ids[0]
+        return None
+
+    def _refresh_mms_depends_combo(self, *, selected_dep: str | None = None) -> None:
+        self.mmsDependsOnCombo.blockSignals(True)
+        self.mmsDependsOnCombo.clear()
+        self.mmsDependsOnCombo.addItem("(none)", None)
+        for pms_id in self._pms_job_ids():
+            self.mmsDependsOnCombo.addItem(pms_id, pms_id)
+        target = selected_dep
+        if target is None:
+            target = self._default_mms_dependency()
+        idx = self.mmsDependsOnCombo.findData(target)
+        if idx < 0:
+            idx = 0
+        self.mmsDependsOnCombo.setCurrentIndex(idx)
+        self.mmsDependsOnCombo.blockSignals(False)
+
+    def _revalidate_mms_dependencies(self) -> list[str]:
+        """
+        Validate GUI-level MMS dependency selections and expose warnings.
+        """
+        errors: list[str] = []
+        by_id = {j.job_id: j for j in self._jobs}
+        for job in self._jobs:
+            if job.kind != "bezierfit_micrograph_mms":
+                if job.depends_on:
+                    job.depends_on = []
+                continue
+            deps = [str(x) for x in job.depends_on]
+            if len(deps) > 1:
+                errors.append(
+                    f"MMS job {job.job_id!r} has multiple dependencies {deps}. "
+                    "Select at most one PMS dependency in the GUI."
+                )
+            for dep_id in deps:
+                dep_job = by_id.get(dep_id)
+                if dep_job is None:
+                    errors.append(f"MMS job {job.job_id!r} depends on missing job_id {dep_id!r}.")
+                elif dep_job.kind != "bezierfit_particle_pms":
+                    errors.append(
+                        f"MMS job {job.job_id!r} depends on {dep_id!r} (kind={dep_job.kind!r}); "
+                        "GUI only allows PMS dependencies."
+                    )
+
+        self._dependency_errors = errors
+        if self._selected_row is not None and 0 <= self._selected_row < len(self._jobs):
+            selected = self._jobs[self._selected_row]
+            if selected.kind == "bezierfit_micrograph_mms":
+                selected_errs = [e for e in errors if f"{selected.job_id!r}" in e]
+                if selected_errs:
+                    self.mmsDependencyWarningLabel.setText("Dependency warning: " + selected_errs[0])
+                else:
+                    self.mmsDependencyWarningLabel.setText("")
+            else:
+                self.mmsDependencyWarningLabel.setText("")
+        else:
+            self.mmsDependencyWarningLabel.setText("")
+        return errors
+
     def _sync_input_base_dir_widgets(self, job: _GuiJob, *, set_checkbox: bool = True) -> None:
         """
         Update the input_base_dir UI controls for the given job.
@@ -701,14 +843,17 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     "control_points": "",
                     "points_step": 0.001,
                     "physical_membrane_dist": 35,
+                    "output_dirname": "subtracted",
                     "batch_size": 20,
                     "resume": True,
                     "force": False,
                     "adopt_existing_outputs": False,
                     "skip_failed": False,
                 },
+                depends_on=[],
             )
         )
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=0)
 
     def _next_job_id(self) -> str:
@@ -763,6 +908,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         rows = self.jobsTable.selectionModel().selectedRows()
         if not rows:
             self._selected_row = None
+            self.mmsDependencyWarningLabel.setText("")
             return
         self._selected_row = int(rows[0].row())
         self._load_selected_into_editor()
@@ -806,6 +952,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.pmsControlPointsEdit.setText(str(job.args.get("control_points", "")))
             self.pmsPointsStepEdit.setText(str(job.args.get("points_step", "0.001")))
             self.pmsPhysDistEdit.setText(str(job.args.get("physical_membrane_dist", "35")))
+            self.pmsOutputDirnameEdit.setText(str(job.args.get("output_dirname", "subtracted")))
             self.pmsBatchSizeEdit.setText(str(job.args.get("batch_size", "20")))
             self.pmsResumeCheck.setChecked(bool(job.args.get("resume", True)))
             self.pmsForceCheck.setChecked(bool(job.args.get("force", False)))
@@ -814,14 +961,24 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         else:
             self.kindStack.setCurrentIndex(2)
             self.mmsParticleStarEdit.setText(str(job.args.get("particle", "")))
+            depends_value = job.depends_on[0] if job.depends_on else self._default_mms_dependency()
+            if not job.depends_on and depends_value is not None:
+                job.depends_on = [depends_value]
+            self._refresh_mms_depends_combo(selected_dep=depends_value)
+            self.mmsParticleOutputRootEdit.setText(str(job.args.get("particle_output_root", "")))
+            self.mmsOutputDirnameEdit.setText(str(job.args.get("output_dirname", "subtracted")))
             self.mmsBatchSizeEdit.setText(str(job.args.get("batch_size", "30")))
             self.mmsResumeCheck.setChecked(bool(job.args.get("resume", True)))
             self.mmsForceCheck.setChecked(bool(job.args.get("force", False)))
             self.mmsAdoptCheck.setChecked(bool(job.args.get("adopt_existing_outputs", False)))
             self.mmsSkipFailedCheck.setChecked(bool(job.args.get("skip_failed", False)))
             self.mmsRequireParticleMxtCheck.setChecked(bool(job.args.get("require_particle_mxt", True)))
+            self.mmsStrictDepsCheck.setChecked(bool(job.args.get("strict_dependencies", True)))
+            self.mmsWriteOutputStarCheck.setChecked(bool(job.args.get("write_output_star", True)))
+            self.mmsOutputStarPathEdit.setText(str(job.args.get("output_star_path", "")))
 
         self._sync_input_base_dir_widgets(job, set_checkbox=True)
+        self._revalidate_mms_dependencies()
 
     def _apply_editor_to_selected_job(self) -> None:
         if self._selected_row is None:
@@ -829,6 +986,8 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         if not (0 <= self._selected_row < len(self._jobs)):
             return
         job = self._jobs[self._selected_row]
+        prev_job_id = str(job.job_id)
+        prev_kind = str(job.kind)
 
         job.job_id = self.jobIdEdit.text().strip() or job.job_id
         job.kind = _LABEL_TO_KIND.get(self.kindCombo.currentText(), job.kind)
@@ -858,6 +1017,23 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         else:
             job.input_base_dir = ""
 
+        if job.kind == "bezierfit_micrograph_mms":
+            current_dep = job.depends_on[0] if job.depends_on else None
+            if prev_kind != job.kind or prev_job_id != job.job_id:
+                self._refresh_mms_depends_combo(selected_dep=current_dep)
+            selected_dep = self.mmsDependsOnCombo.currentData()
+            if isinstance(selected_dep, str) and selected_dep.strip() != "":
+                job.depends_on = [selected_dep]
+            else:
+                auto_dep = self._default_mms_dependency()
+                if auto_dep is not None:
+                    job.depends_on = [auto_dep]
+                    self._refresh_mms_depends_combo(selected_dep=auto_dep)
+                else:
+                    job.depends_on = []
+        else:
+            job.depends_on = []
+
         # Kind-specific args
         if job.kind == "bezierfit_mem_analyze":
             job.args = {
@@ -881,6 +1057,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                 "control_points": self.pmsControlPointsEdit.text().strip(),
                 "points_step": _safe_float(self.pmsPointsStepEdit.text(), default=0.001),
                 "physical_membrane_dist": _safe_int(self.pmsPhysDistEdit.text(), default=35),
+                "output_dirname": self.pmsOutputDirnameEdit.text().strip() or "subtracted",
                 "batch_size": _safe_int(self.pmsBatchSizeEdit.text(), default=20),
                 "resume": bool(self.pmsResumeCheck.isChecked()),
                 "force": bool(self.pmsForceCheck.isChecked()),
@@ -888,14 +1065,21 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                 "skip_failed": bool(self.pmsSkipFailedCheck.isChecked()),
             }
         else:
+            particle_output_root = self.mmsParticleOutputRootEdit.text().strip()
+            output_star_path = self.mmsOutputStarPathEdit.text().strip()
             job.args = {
                 "particle": self.mmsParticleStarEdit.text().strip(),
+                "particle_output_root": particle_output_root if particle_output_root != "" else None,
+                "output_dirname": self.mmsOutputDirnameEdit.text().strip() or "subtracted",
                 "batch_size": _safe_int(self.mmsBatchSizeEdit.text(), default=30),
                 "resume": bool(self.mmsResumeCheck.isChecked()),
                 "force": bool(self.mmsForceCheck.isChecked()),
                 "adopt_existing_outputs": bool(self.mmsAdoptCheck.isChecked()),
                 "skip_failed": bool(self.mmsSkipFailedCheck.isChecked()),
                 "require_particle_mxt": bool(self.mmsRequireParticleMxtCheck.isChecked()),
+                "strict_dependencies": bool(self.mmsStrictDepsCheck.isChecked()),
+                "write_output_star": bool(self.mmsWriteOutputStarCheck.isChecked()),
+                "output_star_path": output_star_path if output_star_path != "" else None,
             }
 
         self.outputRootEdit.setEnabled(bool(job.custom_output_root))
@@ -904,6 +1088,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             self.inputBaseDirEdit.setText(str(job.input_base_dir))
         self._sync_input_base_dir_widgets(job, set_checkbox=False)
 
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=self._selected_row)
 
     def _on_kind_changed(self) -> None:
@@ -933,14 +1118,17 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     "control_points": "",
                     "points_step": 0.001,
                     "physical_membrane_dist": 35,
+                    "output_dirname": "subtracted",
                     "batch_size": 20,
                     "resume": True,
                     "force": False,
                     "adopt_existing_outputs": False,
                     "skip_failed": False,
                 },
+                depends_on=[],
             )
         )
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=len(self._jobs) - 1)
 
     def _on_duplicate_job(self) -> None:
@@ -966,8 +1154,10 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             input_base_dir=str(base.input_base_dir),
             custom_input_base_dir=bool(base.custom_input_base_dir),
             args=dict(base.args),
+            depends_on=list(base.depends_on),
         )
         self._jobs.insert(self._selected_row + 1, clone)
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=self._selected_row + 1)
 
     def _on_remove_job(self) -> None:
@@ -976,6 +1166,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         self._jobs.pop(self._selected_row)
         new_row = min(self._selected_row, len(self._jobs) - 1)
         self._selected_row = None
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=new_row if new_row >= 0 else None)
 
     def _on_sweep_job(self) -> None:
@@ -1014,10 +1205,12 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     input_base_dir=str(base.input_base_dir),
                     custom_input_base_dir=bool(base.custom_input_base_dir),
                     args=new_args,
+                    depends_on=list(base.depends_on),
                 )
             )
 
         self._jobs[self._selected_row + 1 : self._selected_row + 1] = inserted
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=self._selected_row + 1)
 
     # ------------------------- Import/export -------------------------
@@ -1049,6 +1242,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     input_base_dir=imported_base,
                     custom_input_base_dir=bool(imported_base),
                     args=imported_args,
+                    depends_on=list(j.depends_on),
                     status="queued",
                 )
             )
@@ -1066,6 +1260,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        self._revalidate_mms_dependencies()
         self._refresh_table(select_row=0 if self._jobs else None)
 
     def _on_export_spec(self) -> None:
@@ -1090,6 +1285,16 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
     # ------------------------- Scheduler run/stop -------------------------
 
     def _generate_spec_dict(self) -> dict[str, Any]:
+        dep_errors = self._revalidate_mms_dependencies()
+        if dep_errors:
+            preview = "\n".join(dep_errors[:8])
+            if len(dep_errors) > 8:
+                preview += f"\n... and {len(dep_errors) - 8} more"
+            raise ValueError(
+                "Invalid MMS dependency selections in GUI. Please fix before export/run.\n"
+                f"{preview}"
+            )
+
         gpus = parse_gpu_list(self.gpusLineEdit.text().strip())
         policy = "fill_first" if self.policyCombo.currentText().startswith("fill_first") else "round_robin"
         max_running = int(self.maxRunningSpin.value())
@@ -1115,12 +1320,14 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                     "kind": job.kind,
                     "enabled": True,
                     "output_root": job.output_root,
+                    "depends_on": list(job.depends_on),
                     "resources": {"gpus": int(job.gpus), "procs": job.procs},
                     "args": args,
                 }
             )
 
         return {
+            "spec_schema_version": 2,
             "scheduler": {
                 "gpus": list(gpus),
                 "policy": policy,
@@ -1229,6 +1436,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
                 output_root=str(job.output_root),
                 resources=JobResources(gpus=int(job.gpus), procs=job.procs),
                 enabled=job.enabled,
+                depends_on=tuple(job.depends_on),
             )
             argv = build_job_argv(bjob)
             CommandPreviewDialog(argv, self, title=f"Job Command: {job.job_id}").exec_()
