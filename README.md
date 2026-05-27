@@ -45,6 +45,7 @@ For detailed usage tutorials, please refer to the [wiki usage section](https://m
 This fork keeps the upstream workflow, with a few operational fixes for HPC use:
 
 * The GUI configures Linux X11 sessions before importing Qt: `QT_X11_NO_MITSHM=1` is set to avoid fragile shared-memory behavior over SSH forwarding. Matplotlib backend selection is left to the running Qt GUI framework.
+* RadonFit membrane analysis accepts `--procs`/`--cpu` for template-level multiprocessing. Use `--procs 96` on a 96-core node to process up to 96 templates concurrently; `0` auto-detects CPU count and caps at the template count.
 * RadonFit particle membrane subtraction treats `--procs` as GPU worker processes; the default `0` auto-detects visible CUDA devices. Each worker logs its assigned CUDA device at startup.
 * `--batch_size` is now a progress/reporting window; real parallelism is controlled by `--procs`, avoiding minibatch barriers that can leave GPUs idle.
 * RadonFit particle and micrograph membrane subtraction accept `--output_dirname`; use the same value for both steps so MMS finds the matching PMS stacks and `.mxt` sidecars.

@@ -154,7 +154,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         self.particles_starfile_name = None
         self.output_starfile_name = None
         self.info_json_name = None
-        self.kappa_template = False
+        self.kappa_template = -1
         self.process = None
         self.kappa_number = None
         self.kappa_start_value = None
@@ -171,6 +171,21 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         self.edge_sigma_for_mask = None
         self.extra_mem_dist = None
         self.mem_edge_sigma = None
+        self.procs = None
+
+        self.procs_label = QtWidgets.QLabel("Procs", self.horizontalLayoutWidget)
+        self.procs_lineEdit = QtWidgets.QLineEdit(self.horizontalLayoutWidget)
+        self.procs_lineEdit.setText("0")
+        self.procs_lineEdit.setFixedWidth(56)
+        procs_tip = (
+            "Template worker processes for Membrane Analyzer.\n"
+            "Use 96 to process up to 96 templates concurrently.\n"
+            "0 = auto-detect CPU count, capped by template count."
+        )
+        self.procs_label.setToolTip(procs_tip)
+        self.procs_lineEdit.setToolTip(procs_tip)
+        self.horizontalLayout.insertWidget(0, self.procs_label)
+        self.horizontalLayout.insertWidget(1, self.procs_lineEdit)
 
         self._process_pid = None
         self.check_running_process()
@@ -210,7 +225,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         if state == QtCore.Qt.Checked:
             self.kappa_template = self.whichtemplate_spinBox.value()
         elif state == QtCore.Qt.Unchecked:
-            self.kappa_template = False
+            self.kappa_template = -1
     def start_process(self):
         ok, details = check_cupy_cuda_available()
         if not ok:
@@ -239,6 +254,8 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
         self.edge_sigma_for_mask = self.edge_sigma_for_mask_textedit.text()
         self.extra_mem_dist = self.extra_mem_dist_textedit.text()
         self.mem_edge_sigma = self.edge_sigma_for_mem_average_textedit.text()
+        self.procs = self.procs_lineEdit.text()
+        self.kappa_template = self.whichtemplate_spinBox.value() if self.kappa_templates_checkBox.isChecked() else -1
         params = ['--templates_starfile_name', f'{self.templates_starfile_name}',
                   '--output_filename', f'{self.output_starfile_name}',
                   '--particle_starfile_name', f'{self.particles_starfile_name}',
@@ -257,7 +274,8 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                   '--curve_kappa_step', f'{self.curve_kappa_step}',
                   '--edge_sigma', f'{self.edge_sigma_for_mask}',
                   '--extra_mem_dist', f'{self.extra_mem_dist}',
-                  '--mem_edge_sigma', f'{self.mem_edge_sigma}']
+                  '--mem_edge_sigma', f'{self.mem_edge_sigma}',
+                  '--procs', f'{self.procs}']
         # self.process = subprocess.Popen(['python', 'membrane_analysis-main.py'] + params)
 
         with open(self.LOG_FILE, 'w') as f:
@@ -275,6 +293,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
                 **popen_kwargs_for_new_session(),
             )
         print("Radonfit Membrane Analysis started with PID:", self.process.pid)
+        print(f"Radonfit Membrane Analysis started using {self.procs} template worker process(es)")
         self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
