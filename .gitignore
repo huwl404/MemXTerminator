@@ -5,3 +5,6 @@ __pycache__/
 AGENTS.md
 .ace-tool/
 docs/
+
+test/
+*codex.md
