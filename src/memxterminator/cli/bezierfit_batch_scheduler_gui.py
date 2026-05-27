@@ -4,7 +4,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,7 @@ from memxterminator.path_resolve import infer_input_base_dir, normalise_dir
 
 from ._command_preview import CommandPreviewDialog
 from ._deps import check_cupy_cuda_available
-from ._process import popen_kwargs_for_new_session, terminate_pid
+from ._process import popen_kwargs_for_new_session, python_executable_for_subprocess, terminate_pid
 from ._sweep_builder import SweepBuilderDialog, _sanitise_suffix
 
 
@@ -1369,7 +1368,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
         Path(self._spec_path).write_text(json.dumps(spec_dict, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         cmd = [
-            sys.executable,
+            python_executable_for_subprocess(),
             "-u",
             "-m",
             "memxterminator.bezierfit.scheduler.cli",
@@ -1447,7 +1446,7 @@ class BezierfitBatchSchedulerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Command", "Run root/spec not configured yet.")
             return
         cmd = [
-            sys.executable,
+            python_executable_for_subprocess(),
             "-u",
             "-m",
             "memxterminator.bezierfit.scheduler.cli",

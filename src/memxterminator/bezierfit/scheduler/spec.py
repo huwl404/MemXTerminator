@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
+from memxterminator.cli._process import python_executable_for_subprocess
 from memxterminator.mxt_state import validate_output_dirname
 
 JobKind = Literal[
@@ -554,7 +554,7 @@ def build_job_argv(job: BezierfitJob) -> list[str]:
     else:  # pragma: no cover
         raise ValueError(f"Unsupported job kind: {job.kind!r}")
 
-    argv: list[str] = [sys.executable, "-u", "-m", module]
+    argv: list[str] = [python_executable_for_subprocess(), "-u", "-m", module]
 
     args = dict(job.args)
     if job.kind in {"bezierfit_particle_pms", "bezierfit_micrograph_mms"}:

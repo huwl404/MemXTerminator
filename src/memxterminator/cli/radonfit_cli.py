@@ -13,10 +13,9 @@ import json
 import mrcfile
 import subprocess
 import shlex
-import sys
 
 from ._deps import check_cupy_cuda_available
-from ._process import popen_kwargs_for_new_session, terminate_pid
+from ._process import popen_kwargs_for_new_session, python_executable_for_subprocess, terminate_pid
 from ..mxt_state import validate_output_dirname
 
 
@@ -263,7 +262,7 @@ class MembraneAnalyzerApp(QtWidgets.QDialog, Ui_MembraneAnalyzer):
 
         with open(self.LOG_FILE, 'w') as f:
             # self.process = subprocess.Popen(['python','-u', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'membrane_analysis-main.py')] + params, stdout=f, stderr=subprocess.STDOUT)
-            cmd = [sys.executable, '-u', '-m', 'memxterminator.radonfit.bin.membrane_analysis-main'] + params
+            cmd = [python_executable_for_subprocess(), '-u', '-m', 'memxterminator.radonfit.bin.membrane_analysis-main'] + params
             try:
                 f.write(f">>> Command: {shlex.join(cmd)}\n")
                 f.flush()
@@ -442,7 +441,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
             "--output_dirname",
             self.Output_dirname_lineEdit.text(),
         ]
-        return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.membrane_subtract-main"] + params
+        return [python_executable_for_subprocess(), "-u", "-m", "memxterminator.radonfit.bin.membrane_subtract-main"] + params
 
     def show_command(self) -> None:
         from ._command_preview import CommandPreviewDialog
@@ -634,7 +633,7 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
             "--output_dirname",
             output_dirname,
         ]
-        return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.micrograph_mem_subtraction"] + params
+        return [python_executable_for_subprocess(), "-u", "-m", "memxterminator.radonfit.bin.micrograph_mem_subtraction"] + params
 
     def show_command(self) -> None:
         from ._command_preview import CommandPreviewDialog

@@ -2,6 +2,26 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
+from pathlib import Path
+
+
+def python_executable_for_subprocess() -> str:
+    """
+    Pick the interpreter GUI-launched subprocesses should use.
+
+    HPC environment modules can prepend CUDA's `bin/` ahead of conda, making
+    `sys.executable` point at `/software/cuda/.../bin/python`. Prefer the active
+    conda env interpreter when available so `python -m memxterminator...` can
+    import the package installed in that env.
+    """
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        exe_name = "python.exe" if os.name == "nt" else "python"
+        candidate = Path(conda_prefix) / ("Scripts" if os.name == "nt" else "bin") / exe_name
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def popen_kwargs_for_new_session() -> dict:

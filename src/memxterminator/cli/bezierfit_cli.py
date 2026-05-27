@@ -11,9 +11,9 @@ import subprocess
 import os
 import json
 import shlex
-import sys
 
 from ._deps import check_cupy_cuda_available
+from ._process import python_executable_for_subprocess
 
 class MembraneAnalyzer_Bezier_App(QtWidgets.QDialog, Ui_MembraneAnalyzer_Bezierfit):
     PID_FILE = 'process.pid'
@@ -112,7 +112,7 @@ class MembraneAnalyzer_Bezier_App(QtWidgets.QDialog, Ui_MembraneAnalyzer_Bezierf
             '--refine_cpus', f'{int(self.refine_cpus)}']
         
         with open('run.out', 'w') as f:
-            cmd = [sys.executable, '-u', '-m', 'memxterminator.bezierfit.bin.mem_analyze_main'] + params
+            cmd = [python_executable_for_subprocess(), '-u', '-m', 'memxterminator.bezierfit.bin.mem_analyze_main'] + params
             try:
                 f.write(f">>> Command: {shlex.join(cmd)}\n")
                 f.flush()
@@ -230,7 +230,7 @@ class ParticleMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_ParticleMembr
             "--procs",
             procs,
         ]
-        return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.mem_subtract_main"] + params
+        return [python_executable_for_subprocess(), "-u", "-m", "memxterminator.bezierfit.bin.mem_subtract_main"] + params
 
     def show_command(self) -> None:
         from ._command_preview import CommandPreviewDialog
@@ -342,7 +342,7 @@ class MicrographMembraneSubtraction_Bezier_App(QtWidgets.QDialog, Ui_MicrographM
             batch_size = str(int(batch_size))
 
         params = ["--particle", particle_star, "--procs", procs, "--batch_size", batch_size]
-        return [sys.executable, "-u", "-m", "memxterminator.bezierfit.bin.micrograph_mem_subtract_main"] + params
+        return [python_executable_for_subprocess(), "-u", "-m", "memxterminator.bezierfit.bin.micrograph_mem_subtract_main"] + params
 
     def show_command(self) -> None:
         from ._command_preview import CommandPreviewDialog

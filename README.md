@@ -44,10 +44,11 @@ For detailed usage tutorials, please refer to the [wiki usage section](https://m
 
 This fork keeps the upstream workflow, with a few operational fixes for HPC use:
 
-* The GUI configures Linux X11 sessions before importing plotting code: `QT_X11_NO_MITSHM=1` is set, and Matplotlib uses `TkAgg` over forwarded X11 when available, falling back to `Agg` when no display/Tk is present. Override with `MPLBACKEND` or `MXT_MPL_BACKEND` if needed. Previously observed [here](https://github.com/huwl404/NiLab/blob/master/targetdetection/showimg.py)
+* The GUI configures Linux X11 sessions before importing plotting code: `QT_X11_NO_MITSHM=1` is set, and Matplotlib uses `TkAgg` over forwarded X11 when available, falling back to `Agg` when no display/Tk is present. Override with `MPLBACKEND` or `MXT_MPL_BACKEND` if needed. Previously observed [here](https://github.com/huwl404/NiLab/blob/master/targetdetection/showimg.py).
 * RadonFit particle membrane subtraction treats `--procs` as GPU worker processes; the default `0` auto-detects visible CUDA devices. Each worker logs its assigned CUDA device at startup.
 * `--batch_size` is now a progress/reporting window; real parallelism is controlled by `--procs`, avoiding minibatch barriers that can leave GPUs idle.
 * RadonFit particle and micrograph membrane subtraction accept `--output_dirname`; use the same value for both steps so MMS finds the matching PMS stacks and `.mxt` sidecars.
+* On HPC systems where CUDA modules prepend their own Python, install/run from the conda env explicitly, e.g. `$CONDA_PREFIX/bin/python -m pip install -e .`; GUI-launched jobs prefer `$CONDA_PREFIX/bin/python` when available.
 
 ## License
 
