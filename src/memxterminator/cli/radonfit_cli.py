@@ -1,3 +1,7 @@
+from ._gui_runtime import configure_gui_runtime
+
+configure_gui_runtime()
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QMainWindow, QFileDialog, QMessageBox, QApplication, QDialog
 from ..GUI.radon_gui import Ui_Form
@@ -13,6 +17,7 @@ import sys
 
 from ._deps import check_cupy_cuda_available
 from ._process import popen_kwargs_for_new_session, terminate_pid
+from ..mxt_state import validate_output_dirname
 
 
 class RadonApp(QtWidgets.QDialog, Ui_Form):
@@ -358,6 +363,18 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.CPU_label.setText("Procs")
         self.CPU_label.setToolTip(worker_tip)
         self.CPU_lineEdit.setToolTip(worker_tip)
+        batch_tip = (
+            "Progress/reporting window for processed particle stacks.\n"
+            "Actual GPU concurrency is controlled by Procs."
+        )
+        self.Batch_size_label.setToolTip(batch_tip)
+        self.Batch_size_lineEdit.setToolTip(batch_tip)
+        output_dir_tip = (
+            "Single output directory name replacing extract/ in particle stack paths.\n"
+            "Use a different name to compare membrane subtraction parameter sets."
+        )
+        self.Output_dirname_label.setToolTip(output_dir_tip)
+        self.Output_dirname_lineEdit.setToolTip(output_dir_tip)
 
 
         self.mem_analysis_starfile_name = None
@@ -369,6 +386,7 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.scaling_factor_step = self.Step_lineEdit.text()
         self.cpu = self.CPU_lineEdit.text()
         self.batch_size = self.Batch_size_lineEdit.text()
+        self.output_dirname = self.Output_dirname_lineEdit.text()
         self.process = None
         self._process_pid = None
 
@@ -421,6 +439,8 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
             self.CPU_lineEdit.text(),
             "--batch_size",
             self.Batch_size_lineEdit.text(),
+            "--output_dirname",
+            self.Output_dirname_lineEdit.text(),
         ]
         return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.membrane_subtract-main"] + params
 
@@ -451,14 +471,19 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
         self.scaling_factor_step = self.Step_lineEdit.text()
         self.cpu = self.CPU_lineEdit.text()
         self.batch_size = self.Batch_size_lineEdit.text()
+        try:
+            self.output_dirname = validate_output_dirname(self.Output_dirname_lineEdit.text())
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid output directory name", str(exc))
+            return
         with open(self.LOG_FILE, 'w') as f:
             cmd = self._build_cmd()
             particles_star = self.particles_selected_starfile_lineEdit.text()
             base, ext = os.path.splitext(particles_star)
             if ext.lower() != ".star":
                 base = particles_star
-            out_star_all = f"{base}_subtracted.star"
-            out_star_completed = f"{base}_subtracted_completed.star"
+            out_star_all = f"{base}_{self.output_dirname}.star"
+            out_star_completed = f"{base}_{self.output_dirname}_completed.star"
             f.write(f">>> STAR outputs (for cryoSPARC import): {out_star_all}\n")
             f.write(f">>> STAR outputs (completed-only): {out_star_completed}\n")
             try:
@@ -473,7 +498,10 @@ class MembraneSubtractionApp(QtWidgets.QDialog, Ui_MembraneSubtraction):
                 **popen_kwargs_for_new_session(),
             )
         print("Radonfit Membrane Subtraction started with PID:", self.process.pid)
-        print(f"Radonfit Membrane Subtraction started using {self.cpu} procs and batch size of {self.batch_size}")
+        print(
+            "Radonfit Membrane Subtraction started using "
+            f"{self.cpu} procs, batch size {self.batch_size}, output_dirname={self.output_dirname}"
+        )
         self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))
@@ -555,7 +583,14 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         self._process_pid = None
         self.cpus = None
         self.batch_size = None
+        self.output_dirname = self.output_dirname_lineEdit.text()
         self.particle = None
+        output_dir_tip = (
+            "Output directory name used by RadonFit particle membrane subtraction.\n"
+            "Use the same value here so micrograph subtraction can find the PMS stacks and .mxt files."
+        )
+        self.output_dirname_label.setToolTip(output_dir_tip)
+        self.output_dirname_lineEdit.setToolTip(output_dir_tip)
         self.check_running_process()
         self.launch_pushButton.clicked.connect(self.start_process)
         self.kill_pushButton.clicked.connect(self.kill_process)
@@ -582,12 +617,23 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         particles_star = self.particles_selected_starfile_lineEdit.text()
         cpus = self.cpus_lineEdit.text()
         batch_size = self.batch_size_lineEdit.text()
+        output_dirname = self.output_dirname_lineEdit.text()
 
         if coerce_numbers:
             cpus = str(int(cpus))
             batch_size = str(int(batch_size))
+            output_dirname = validate_output_dirname(output_dirname)
 
-        params = ["--particles_selected_filename", particles_star, "--procs", cpus, "--batch_size", batch_size]
+        params = [
+            "--particles_selected_filename",
+            particles_star,
+            "--procs",
+            cpus,
+            "--batch_size",
+            batch_size,
+            "--output_dirname",
+            output_dirname,
+        ]
         return [sys.executable, "-u", "-m", "memxterminator.radonfit.bin.micrograph_mem_subtraction"] + params
 
     def show_command(self) -> None:
@@ -615,6 +661,11 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
         self.particle = self.particles_selected_starfile_lineEdit.text()
         self.cpus = self.cpus_lineEdit.text()
         self.batch_size = self.batch_size_lineEdit.text()
+        try:
+            self.output_dirname = validate_output_dirname(self.output_dirname_lineEdit.text())
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid output directory name", str(exc))
+            return
         with open(self.LOG_FILE, 'w') as f:
             cmd = self._build_cmd(coerce_numbers=True)
             try:
@@ -629,7 +680,10 @@ class MicrographMembraneSubtraction_Radon_App(QtWidgets.QDialog, Ui_MicrographMe
                 **popen_kwargs_for_new_session(),
             )
         print("Micrograph Membrane Subtraction started with PID:", self.process.pid)
-        print(f"Micrograph Membrane Subtraction started using {self.cpus} procs and batch size of {self.batch_size}")
+        print(
+            "Micrograph Membrane Subtraction started using "
+            f"{self.cpus} procs, batch size {self.batch_size}, output_dirname={self.output_dirname}"
+        )
         self._process_pid = int(self.process.pid)
         with open(self.PID_FILE, 'w') as f:
             f.write(str(self.process.pid))

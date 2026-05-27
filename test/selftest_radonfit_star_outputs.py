@@ -23,6 +23,10 @@ def _write_mxt(path: Path, *, params_hash: str) -> None:
     path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 
 
+def _stack_path_from_image_ref(image_ref: str) -> Path:
+    return Path(str(image_ref).split("@", 1)[1])
+
+
 def main() -> None:
     # Ensure the repo checkout is used (not an older installed version).
     repo_root = Path(__file__).resolve().parents[1]
@@ -32,7 +36,13 @@ def main() -> None:
 
     import starfile
 
-    from memxterminator.mxt_state import compute_params_hash, to_subtracted_stack_path
+    try:
+        import cupy  # noqa: F401
+    except Exception as exc:
+        print(f">>> SKIP: Radonfit PMS module imports CuPy in this version. Error: {exc}")
+        return
+
+    from memxterminator.mxt_state import compute_params_hash, to_output_stack_path, to_subtracted_stack_path
     from memxterminator.radonfit.lib._utils import read_star_any
     import importlib
 
@@ -88,7 +98,7 @@ def main() -> None:
     out_all_tables = read_star_any(str(out_all))
     out_all_df = next(iter(out_all_tables.values()))
     assert out_all_df.shape[0] == 3
-    assert all("/subtracted/" in s for s in out_all_df["rlnImageName"].astype(str).tolist())
+    assert all("subtracted" in _stack_path_from_image_ref(s).parts for s in out_all_df["rlnImageName"].astype(str).tolist())
     assert out_all_df["rlnImageName"].iloc[0].endswith(f"@{out_a}")
 
     out_completed_tables = read_star_any(str(out_completed))
@@ -120,7 +130,37 @@ def main() -> None:
             particles_block = df
             break
     assert particles_block is not None, "Missing particles block in output STAR"
-    assert all("/subtracted/" in s for s in particles_block["rlnImageName"].astype(str).tolist())
+    assert all("subtracted" in _stack_path_from_image_ref(s).parts for s in particles_block["rlnImageName"].astype(str).tolist())
+
+    # Custom output_dirname: STAR paths must point at the requested output folder,
+    # and completed-only filtering must check the matching .mxt sidecar there.
+    custom_dirname = "subtracted_b005"
+    out_a_custom = Path(to_output_stack_path(str(raw_a), output_dirname=custom_dirname))
+    out_b_custom = Path(to_output_stack_path(str(raw_b), output_dirname=custom_dirname))
+    _touch(out_a_custom)
+    _touch(out_b_custom)
+    _write_mxt(Path(str(out_b_custom) + ".mxt"), params_hash=params_hash)
+
+    out_all_custom = tmp_root / f"particles_selected_{custom_dirname}.star"
+    out_completed_custom = tmp_root / f"particles_selected_{custom_dirname}_completed.star"
+    pms_mod.write_radonfit_pms_star_outputs(
+        input_star=str(in_star),
+        expected_params_hash=params_hash,
+        out_star_all=str(out_all_custom),
+        out_star_completed=str(out_completed_custom),
+        output_dirname=custom_dirname,
+        write_all=True,
+        write_completed=True,
+    )
+    custom_all_df = next(iter(read_star_any(str(out_all_custom)).values()))
+    assert all(
+        custom_dirname in _stack_path_from_image_ref(s).parts
+        for s in custom_all_df["rlnImageName"].astype(str).tolist()
+    )
+    assert custom_all_df["rlnImageName"].iloc[0].endswith(f"@{out_a_custom}")
+    custom_completed_df = next(iter(read_star_any(str(out_completed_custom)).values()))
+    assert custom_completed_df.shape[0] == 1
+    assert custom_completed_df["rlnImageName"].iloc[0].endswith(f"@{out_b_custom}")
 
     print(f">>> Self-test OK. Outputs are under: {tmp_root}")
 

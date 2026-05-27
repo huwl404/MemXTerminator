@@ -8,7 +8,6 @@ import time
 import traceback
 from datetime import datetime, timezone
 from multiprocessing import Pool
-from pathlib import Path
 
 import cupy as cp
 import mrcfile
@@ -21,8 +20,10 @@ from memxterminator.mxt_state import (
     is_uptodate,
     read_mxt,
     release_lock,
-    to_subtracted_stack_path,
+    to_output_micrograph_path,
+    to_output_stack_path,
     try_acquire_lock,
+    validate_output_dirname,
     write_json_atomic,
     write_mrc_atomic,
 )
@@ -64,6 +65,7 @@ class MicrographMembraneSubtract:
         skip_failed: bool = False,
         require_particle_mxt: bool = True,
         strict_output_check: bool = True,
+        output_dirname: str = "subtracted",
     ):
         self.particles_selected_filename = particles_selected_filename
 
@@ -73,6 +75,7 @@ class MicrographMembraneSubtract:
         self.skip_failed = bool(skip_failed)
         self.require_particle_mxt = bool(require_particle_mxt)
         self.strict_output_check = bool(strict_output_check)
+        self.output_dirname = validate_output_dirname(output_dirname)
 
         # `.mxt` stable params/hash for this invocation (pixel-affecting only).
         self.mxt_task = "radonfit_micrograph_mms"
@@ -185,7 +188,7 @@ class MicrographMembraneSubtract:
         run_id: str,
         error=None,
     ) -> dict:
-        output_obj: dict[str, object] = {"path": out_micrograph}
+        output_obj: dict[str, object] = {"path": out_micrograph, "output_dirname": self.output_dirname}
         if os.path.exists(out_micrograph):
             try:
                 output_obj["file"] = fingerprint_file(out_micrograph)
@@ -220,8 +223,11 @@ class MicrographMembraneSubtract:
         setproctitle("MemXTerminator-MMS")
         rawimage_stacks_name, micrograph_name = raw_mg_name
 
-        # Dependency: particle stack must be the PMS "subtracted" output (idempotent mapping).
-        particle_stack_subtracted_path = to_subtracted_stack_path(rawimage_stacks_name)
+        # Dependency: particle stack must be the PMS output matching output_dirname (idempotent mapping).
+        particle_stack_subtracted_path = to_output_stack_path(
+            rawimage_stacks_name,
+            output_dirname=self.output_dirname,
+        )
         particle_stack_mxt_path = particle_stack_subtracted_path + ".mxt"
 
         # Block (don't crash) when dependencies are missing.
@@ -316,10 +322,8 @@ class MicrographMembraneSubtract:
                 except Exception:
                     particle_pms_params_hash = None
 
-        # Output path: <micrograph_dir>/../subtracted/<stem>_subtracted<suffix> (Spec v1 §10.3).
-        out_dir = Path(micrograph_name).parent.parent / "subtracted"
-        out_path = out_dir / (Path(micrograph_name).stem + "_subtracted" + Path(micrograph_name).suffix)
-        out_micrograph = str(out_path)
+        # Output path: <micrograph_dir>/../<output_dirname>/<stem>_subtracted<suffix>.
+        out_micrograph = to_output_micrograph_path(micrograph_name, output_dirname=self.output_dirname)
         mxt_path = out_micrograph + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -330,6 +334,7 @@ class MicrographMembraneSubtract:
             "deps": {
                 "particle_pms_params_hash": particle_pms_params_hash,
                 "particle_stack_mxt_path": particle_stack_mxt_path,
+                "output_dirname": self.output_dirname,
             },
         }
 
@@ -625,6 +630,15 @@ if __name__ == '__main__':
     )
     parser.add_argument('--batch_size', type=int, default=30)
     parser.add_argument(
+        "--output_dirname",
+        type=str,
+        default="subtracted",
+        help=(
+            "Name of the PMS/MMS output directory to use for dependency lookup and micrograph outputs "
+            "(default: subtracted). Use the same value as RadonFit particle membrane subtraction."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -662,5 +676,6 @@ if __name__ == '__main__':
         adopt_existing_outputs=args.adopt_existing_outputs,
         skip_failed=args.skip_failed,
         require_particle_mxt=args.require_particle_mxt,
+        output_dirname=args.output_dirname,
     )
     mms.micrograph_mem_subtract_multiprocessing(args.cpu, args.batch_size)

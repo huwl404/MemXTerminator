@@ -3,6 +3,10 @@ import sys
 import mrcfile
 
 def _run_gui() -> None:
+    from ._gui_runtime import configure_gui_runtime
+
+    configure_gui_runtime()
+
     from PyQt5 import QtWidgets
     from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox
 

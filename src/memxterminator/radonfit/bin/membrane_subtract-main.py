@@ -7,7 +7,6 @@ import socket
 import time
 import traceback
 from datetime import datetime, timezone
-from multiprocessing import Pool
 import multiprocessing
 
 import cupy as cp
@@ -21,8 +20,9 @@ from memxterminator.mxt_state import (
     is_uptodate,
     read_mxt,
     release_lock,
-    to_subtracted_stack_path,
+    to_output_stack_path,
     try_acquire_lock,
+    validate_output_dirname,
     write_json_atomic,
     write_mrc_atomic,
 )
@@ -32,17 +32,11 @@ from ..lib.mem_subtract import *
 from setproctitle import setproctitle
 
 _WORKER_RUNNER = None
+_WORKER_DEVICE_ID = None
 
 
 def _remove_duplicates_preserve_order(seq: list[str]) -> list[str]:
     return list(dict.fromkeys(seq))
-
-
-def _chunks(lst: list[str], n: int):
-    if n <= 0:
-        raise ValueError(f"batch_size must be >= 1, got {n}")
-    for i in range(0, len(lst), n):
-        yield lst[i : i + n]
 
 
 def _init_worker(config: dict) -> None:
@@ -53,6 +47,7 @@ def _init_worker(config: dict) -> None:
     a large in-memory object (CuPy arrays, pandas DataFrames) for every task.
     """
     global _WORKER_RUNNER
+    global _WORKER_DEVICE_ID
 
     # Best-effort: pin each worker to a GPU in round-robin order if multiple
     # CUDA devices are visible. Users can still control visibility via
@@ -67,8 +62,15 @@ def _init_worker(config: dict) -> None:
             worker_rank = int(ident[0]) if ident else 1  # 1-based in multiprocessing pools
             device_id = (worker_rank - 1) % device_count
             cp.cuda.Device(device_id).use()
-        except Exception:
-            pass
+            _WORKER_DEVICE_ID = device_id
+            print(
+                f">>> WORKER_INIT pid={os.getpid()} worker_rank={worker_rank} "
+                f"cuda_device={device_id} visible_cuda_devices={device_count}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f">>> WARNING: failed to pin worker pid={os.getpid()} to a CUDA device: {exc}", flush=True)
+            _WORKER_DEVICE_ID = None
 
     _WORKER_RUNNER = MembraneSubtract(**config)
 
@@ -77,6 +79,50 @@ def _process_rawimage_stack_worker(stack_path: str) -> str:
     if _WORKER_RUNNER is None:
         raise RuntimeError("Worker runner not initialized")
     return _WORKER_RUNNER.process_rawimage_stack(stack_path)
+
+
+def _process_stack_paths_with_pool(
+    *,
+    stack_paths: list[str],
+    procs: int,
+    worker_config: dict,
+    batch_size: int,
+) -> list[str]:
+    """
+    Keep GPU workers fed continuously and use `batch_size` only as a progress window.
+
+    Older code submitted one minibatch and waited for every stack in that minibatch
+    before submitting the next one. A single slow stack could leave other GPU
+    workers idle. Continuous dispatch matches the worker-pool architecture better:
+    `--procs` controls real concurrency; `--batch_size` controls progress cadence.
+    """
+    batch_size_int = int(batch_size)
+    if batch_size_int <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    procs_int = int(procs)
+    if procs_int <= 0:
+        raise ValueError(f"procs must be >= 1 after auto-detection, got {procs}")
+
+    outcomes: list[str] = []
+    total = len(stack_paths)
+    if total == 0:
+        return outcomes
+    completed = 0
+    window_completed = 0
+    window_started = time.time()
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=procs_int, initializer=_init_worker, initargs=(worker_config,)) as pool:
+        for outcome in pool.imap_unordered(_process_rawimage_stack_worker, stack_paths, chunksize=1):
+            outcomes.append(outcome)
+            completed += 1
+            window_completed += 1
+            if completed % batch_size_int == 0 or completed == total:
+                now = time.time()
+                print(f">>> {completed} / {total} particle stacks finished.")
+                print(f">>> Last {window_completed} completed stack(s) took {now - window_started:.4f} seconds.")
+                window_completed = 0
+                window_started = now
+    return outcomes
 
 
 def _get_raw_particle_stack_paths(particles_star: str) -> list[str]:
@@ -90,7 +136,7 @@ def _get_raw_particle_stack_paths(particles_star: str) -> list[str]:
     return _remove_duplicates_preserve_order(raw_paths)
 
 
-def _derive_star_output_paths(input_star: str) -> tuple[str, str]:
+def _derive_star_output_paths(input_star: str, *, output_dirname: str = "subtracted") -> tuple[str, str]:
     """
     Derive default STAR output paths from an input STAR path.
 
@@ -98,15 +144,20 @@ def _derive_star_output_paths(input_star: str) -> tuple[str, str]:
         /path/particles_selected.star ->
             /path/particles_selected_subtracted.star
             /path/particles_selected_subtracted_completed.star
+
+        with output_dirname="run_01":
+            /path/particles_selected_run_01.star
+            /path/particles_selected_run_01_completed.star
     """
     base, ext = os.path.splitext(input_star)
     if ext.lower() != ".star":
         # Conservative fallback: treat the whole path as the base.
         base = input_star
-    return f"{base}_subtracted.star", f"{base}_subtracted_completed.star"
+    out_dirname = validate_output_dirname(output_dirname)
+    return f"{base}_{out_dirname}.star", f"{base}_{out_dirname}_completed.star"
 
 
-def _rewrite_particles_rln_image_name_to_subtracted(df_particles):
+def _rewrite_particles_rln_image_name_to_subtracted(df_particles, *, output_dirname: str = "subtracted"):
     """
     Return (df_out, mapped_stack_paths_sub) where `rlnImageName` now points to subtracted stacks.
     """
@@ -118,7 +169,7 @@ def _rewrite_particles_rln_image_name_to_subtracted(df_particles):
     mapped_rln: list[str] = []
     for image_ref in image_names:
         stack_path, idx_1based = parse_relion_image_name_1based(image_ref)
-        stack_path_sub = to_subtracted_stack_path(stack_path)
+        stack_path_sub = to_output_stack_path(stack_path, output_dirname=output_dirname)
         mapped_paths_sub.append(stack_path_sub)
         mapped_rln.append(f"{int(idx_1based)}@{stack_path_sub}")
 
@@ -155,13 +206,14 @@ def write_radonfit_pms_star_outputs(
     expected_params_hash: str,
     out_star_all: str,
     out_star_completed: str,
+    output_dirname: str = "subtracted",
     write_all: bool = True,
     write_completed: bool = True,
 ) -> None:
     """
     Write:
-      - <input>_subtracted.star (all rows, rewritten `rlnImageName`)
-      - <input>_subtracted_completed.star (filtered by `.mxt` success + params_hash)
+      - <input>_<output_dirname>.star (all rows, rewritten `rlnImageName`)
+      - <input>_<output_dirname>_completed.star (filtered by `.mxt` success + params_hash)
 
     Preserves optics block (RELION 3.1+) when present. See Spec v1 §8.
     """
@@ -171,7 +223,10 @@ def write_radonfit_pms_star_outputs(
     star_tables = read_star_any(input_star)
     particles_df = get_relion_particles_table(star_tables)
 
-    df_all, mapped_paths_sub = _rewrite_particles_rln_image_name_to_subtracted(particles_df)
+    out_dirname = validate_output_dirname(output_dirname)
+    df_all, mapped_paths_sub = _rewrite_particles_rln_image_name_to_subtracted(
+        particles_df, output_dirname=out_dirname
+    )
 
     # Build completion mask (one `.mxt` read per unique stack path).
     unique_paths_sub = sorted(set(mapped_paths_sub))
@@ -237,6 +292,7 @@ class MembraneSubtract:
         adopt_existing_outputs: bool = False,
         skip_failed: bool = False,
         strict_output_check: bool = True,
+        output_dirname: str = "subtracted",
     ):
         # Keep paths for `.mxt` input fingerprints.
         self.particles_selected_filename = particles_selected_filename
@@ -248,6 +304,7 @@ class MembraneSubtract:
         self.adopt_existing_outputs = bool(adopt_existing_outputs)
         self.skip_failed = bool(skip_failed)
         self.strict_output_check = bool(strict_output_check)
+        self.output_dirname = validate_output_dirname(output_dirname)
 
         # `.mxt` stable params/hash for this invocation (pixel-affecting only).
         self.mxt_task = "radonfit_particle_pms"
@@ -401,7 +458,7 @@ class MembraneSubtract:
         run_id: str,
         error=None,
     ) -> dict:
-        output_obj: dict[str, object] = {"path": out_stack}
+        output_obj: dict[str, object] = {"path": out_stack, "output_dirname": self.output_dirname}
         if os.path.exists(out_stack):
             try:
                 output_obj["file"] = fingerprint_file(out_stack)
@@ -435,7 +492,7 @@ class MembraneSubtract:
         setproctitle('MemXTerminator-radPMS')
 
         raw_stack = rawimage_stacks_name
-        out_stack = to_subtracted_stack_path(raw_stack)
+        out_stack = to_output_stack_path(raw_stack, output_dirname=self.output_dirname)
         mxt_path = out_stack + ".mxt"
         lock_path = mxt_path + ".lock"
 
@@ -650,17 +707,24 @@ class MembraneSubtract:
         print(f'>>> Found {len(self.rawimage_stacks_name_lst)} raw particle stacks in total.')
         num_cpus_int = int(num_cpus)
         batch_size_int = int(batch_size)
+        if batch_size_int <= 0:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        try:
+            device_count = int(cp.cuda.runtime.getDeviceCount())
+        except Exception:
+            device_count = 0
+        if num_cpus_int <= 0:
+            num_cpus_int = device_count if device_count > 0 else 1
+        if device_count > 0 and num_cpus_int > device_count:
+            print(
+                f">>> WARNING: requested procs={num_cpus_int}, but only {device_count} CUDA device(s) are visible. "
+                "Oversubscribing a single GPU with many processes is often slower."
+            )
 
         if num_cpus_int <= 1:
             for stack_path in self.rawimage_stacks_name_lst:
                 self.process_rawimage_stack(stack_path)
             return
-
-        try:
-            multiprocessing.set_start_method("spawn")
-        except RuntimeError:
-            # Start method can only be set once per interpreter.
-            pass
 
         worker_config = {
             "particles_selected_filename": self.particles_selected_filename,
@@ -675,17 +739,15 @@ class MembraneSubtract:
             "adopt_existing_outputs": bool(self.adopt_existing_outputs),
             "skip_failed": bool(self.skip_failed),
             "strict_output_check": bool(self.strict_output_check),
+            "output_dirname": self.output_dirname,
         }
 
-        minibatches = list(_chunks(self.rawimage_stacks_name_lst, batch_size_int))
-        total_batches = len(minibatches)
-        with Pool(processes=num_cpus_int, initializer=_init_worker, initargs=(worker_config,)) as pool:
-            for i, minibatch in enumerate(minibatches, start=1):
-                start_time = time.time()
-                pool.map(_process_rawimage_stack_worker, minibatch, chunksize=1)
-                end_time = time.time()
-                print(f">>> {i} / {total_batches} minibatch finished.")
-                print(f">>> {len(minibatch)} particle stacks took {end_time - start_time:.4f} seconds.")
+        _process_stack_paths_with_pool(
+            stack_paths=self.rawimage_stacks_name_lst,
+            procs=num_cpus_int,
+            worker_config=worker_config,
+            batch_size=batch_size_int,
+        )
 
 
 def main() -> None:
@@ -702,13 +764,30 @@ def main() -> None:
         "--cpu",
         dest="cpu",
         type=int,
-        default=1,
+        default=0,
         help=(
-            "Number of worker processes. Use 1 for serial (recommended for single-GPU). "
-            "Use 0 to auto-detect from visible GPUs."
+            "Number of GPU worker processes. Default 0 auto-detects visible CUDA devices. "
+            "Use 1 for serial/single-GPU runs."
         ),
     )
-    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=20,
+        help=(
+            "Progress/reporting window for processed particle stacks. "
+            "Actual parallel GPU workers are controlled by --procs."
+        ),
+    )
+    parser.add_argument(
+        "--output_dirname",
+        type=str,
+        default="subtracted",
+        help=(
+            "Name of the output directory replacing the input extract/ path component "
+            "(default: subtracted). Use a single directory name, not a path."
+        ),
+    )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -737,13 +816,13 @@ def main() -> None:
         "--write_star",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Write <input>_subtracted.star after processing (default: enabled).",
+        help="Write the full-size output STAR after processing (default: enabled).",
     )
     parser.add_argument(
         "--write_star_completed",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Write <input>_subtracted_completed.star after processing (default: enabled).",
+        help="Write the completed-only output STAR after processing (default: enabled).",
     )
     parser.add_argument(
         "--star_out_all",
@@ -767,6 +846,9 @@ def main() -> None:
     scaling_factor_end = float(args.scaling_factor_end)
     scaling_factor_step = float(args.scaling_factor_step)
     batch_size = int(args.batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    output_dirname = validate_output_dirname(args.output_dirname)
 
     # Match MembraneSubtract.mxt_params_hash (Spec v1 §8.3).
     expected_params_hash = compute_params_hash(
@@ -793,6 +875,8 @@ def main() -> None:
             f">>> WARNING: requested --procs={cpus_num}, but only {device_count} CUDA device(s) are visible. "
             "Oversubscribing a single GPU with many processes is often slower."
         )
+    print(f">>> CUDA devices visible: {device_count}; using {cpus_num} GPU worker process(es).")
+    print(f">>> Output directory name: {output_dirname}")
 
     print(">>> Preparing Radonfit Particle Membrane Subtraction dataset...")
     stack_paths = _get_raw_particle_stack_paths(particles_selected_filename)
@@ -814,17 +898,12 @@ def main() -> None:
                 force=args.force,
                 adopt_existing_outputs=args.adopt_existing_outputs,
                 skip_failed=args.skip_failed,
+                output_dirname=output_dirname,
             )
             for stack_path in stack_paths:
                 outcomes.append(runner.process_rawimage_stack(stack_path))
         else:
             # Multiprocessing across particle stacks.
-            try:
-                multiprocessing.set_start_method("spawn")
-            except RuntimeError:
-                # Start method can only be set once per interpreter.
-                pass
-
             worker_config = {
                 "particles_selected_filename": particles_selected_filename,
                 "membrane_analysis_filename": membrane_analysis_filename,
@@ -838,17 +917,17 @@ def main() -> None:
                 "adopt_existing_outputs": bool(args.adopt_existing_outputs),
                 "skip_failed": bool(args.skip_failed),
                 "strict_output_check": True,
+                "output_dirname": output_dirname,
             }
 
-            minibatches = list(_chunks(stack_paths, batch_size))
-            total_batches = len(minibatches)
-            with Pool(processes=int(cpus_num), initializer=_init_worker, initargs=(worker_config,)) as pool:
-                for i, minibatch in enumerate(minibatches, start=1):
-                    start_time = time.time()
-                    outcomes.extend(pool.map(_process_rawimage_stack_worker, minibatch, chunksize=1))
-                    end_time = time.time()
-                    print(f">>> {i} / {total_batches} minibatch finished.")
-                    print(f">>> {len(minibatch)} particle stacks took {end_time - start_time:.4f} seconds.")
+            outcomes.extend(
+                _process_stack_paths_with_pool(
+                    stack_paths=stack_paths,
+                    procs=int(cpus_num),
+                    worker_config=worker_config,
+                    batch_size=batch_size,
+                )
+            )
 
         succeeded = sum(1 for x in outcomes if x in {"SUCCESS", "SKIP_UPTODATE", "ADOPT_EXISTING_OUTPUT"})
         skipped = sum(1 for x in outcomes if x in {"LOCKED_SKIP", "SKIP_FAILED"})
@@ -859,7 +938,9 @@ def main() -> None:
         raise
     finally:
         if args.write_star or args.write_star_completed:
-            out_all_default, out_completed_default = _derive_star_output_paths(particles_selected_filename)
+            out_all_default, out_completed_default = _derive_star_output_paths(
+                particles_selected_filename, output_dirname=output_dirname
+            )
             out_star_all = args.star_out_all or out_all_default
             out_star_completed = args.star_out_completed or out_completed_default
             print(f">>> STAR outputs (for cryoSPARC import): {out_star_all}")
@@ -870,6 +951,7 @@ def main() -> None:
                     expected_params_hash=expected_params_hash,
                     out_star_all=out_star_all,
                     out_star_completed=out_star_completed,
+                    output_dirname=output_dirname,
                     write_all=args.write_star,
                     write_completed=args.write_star_completed,
                 )

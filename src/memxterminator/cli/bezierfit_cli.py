@@ -1,3 +1,7 @@
+from ._gui_runtime import configure_gui_runtime
+
+configure_gui_runtime()
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtWidgets import QMainWindow, QFileDialog, QMessageBox, QApplication, QDialog
 from ..GUI.MembraneAnalyzer_Bezierfit import Ui_MembraneAnalyzer_Bezierfit
